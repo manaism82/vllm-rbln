@@ -15,6 +15,7 @@ from abc import ABC, abstractmethod
 from typing import Any
 
 import torch
+import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.models.interfaces import SupportsMultiModal
@@ -25,14 +26,29 @@ from vllm.model_executor.models.qwen2_5_vl import (
     Qwen2_5_VLVideoPixelInputs,
 )
 from vllm.model_executor.models.qwen2_vl import (
+    Qwen2VLDummyInputsBuilder,
     Qwen2VLImageEmbeddingInputs,
     Qwen2VLImagePixelInputs,
+    Qwen2VLMultiModalProcessor,
+    Qwen2VLProcessingInfo,
     Qwen2VLVideoEmbeddingInputs,
     Qwen2VLVideoPixelInputs,
 )
+from vllm.multimodal import MULTIMODAL_REGISTRY
 
 from .base import ModelInputForRBLN
 from .model_base import RBLNOptimumDecoderMixin, RBLNOptimumModelBase
+
+
+class _Qwen3_5MoeProcessingInfo(Qwen2VLProcessingInfo):
+    """Qwen3.5-MoE shares Qwen2-VL's processor pipeline but uses its own HF
+    config class (`Qwen3_5MoeConfig`)."""
+
+    def get_hf_config(self):
+        from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import (
+            Qwen3_5MoeConfig,
+        )
+        return self.ctx.get_hf_config(Qwen3_5MoeConfig)
 
 logger = init_logger(__name__)
 
@@ -505,3 +521,153 @@ class RBLNOptimumQwen3VLMoeForConditionalGeneration(
     """
 
     pass
+
+
+@MULTIMODAL_REGISTRY.register_processor(
+    Qwen2VLMultiModalProcessor,
+    info=_Qwen3_5MoeProcessingInfo,
+    dummy_inputs=Qwen2VLDummyInputsBuilder,
+)
+class RBLNOptimumQwen3_5MoeForConditionalGeneration(
+    RBLNOptimumQwenVLForConditionalGeneration
+):
+    """
+    Qwen3.5-MoE has a vision encoder but does NOT use DeepStack
+    (unlike Qwen3-VL-MoE), so it inherits from the QwenVL base instead of
+    RBLNOptimumQwen3VLForConditionalGeneration.
+
+    DeltaNet recurrent states are managed inside the optimum-rbln runtime model
+    (Qwen3_5Moe_LanguageModelWrapper) and not exposed to vLLM.
+    """
+
+    def _add_model_specific_args(self, preprocess_args: dict, video_input: Any):
+        pass
+
+    def _create_image_pixel_inputs(self, pixel_values, image_grid_thw):
+        return Qwen2_5_VLImagePixelInputs(
+            type="pixel_values",
+            pixel_values=pixel_values,
+            image_grid_thw=image_grid_thw,
+        )
+
+    def _create_image_embedding_inputs(self, image_embeds, image_grid_thw):
+        return Qwen2_5_VLImageEmbeddingInputs(
+            type="image_embeds",
+            image_embeds=image_embeds,
+            image_grid_thw=image_grid_thw,
+        )
+
+    def _create_video_pixel_inputs(
+        self, pixel_values_videos, video_grid_thw, second_per_grid_ts
+    ):
+        return Qwen2_5_VLVideoPixelInputs(
+            type="pixel_values_videos",
+            pixel_values_videos=pixel_values_videos,
+            video_grid_thw=video_grid_thw,
+            second_per_grid_ts=second_per_grid_ts,
+        )
+
+    def _create_video_embedding_inputs(self, video_embeds, video_grid_thw):
+        return Qwen2_5_VLVideoEmbeddingInputs(
+            type="video_embeds",
+            video_embeds=video_embeds,
+            video_grid_thw=video_grid_thw,
+        )
+
+    def preprocess_prefill(
+        self, input_ids, attention_mask, image_input, video_input
+    ):
+        preprocess_args = {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "pixel_values": image_input["pixel_values"]
+            if image_input is not None
+            else None,
+            "image_grid_thw": image_input["image_grid_thw"]
+            if image_input is not None
+            else None,
+            "pixel_values_videos": video_input["pixel_values_videos"]
+            if video_input is not None
+            else None,
+            "video_grid_thw": video_input["video_grid_thw"]
+            if video_input is not None
+            else None,
+        }
+        self._add_model_specific_args(preprocess_args, video_input)
+
+        # Qwen3.5 returns 3 values (no deepstack)
+        inputs_embeds, position_embed, rope_deltas = self.model._preprocess_prefill(
+            **preprocess_args
+        )
+        return inputs_embeds, position_embed, rope_deltas
+
+    def forward(self, model_input: ModelInputForRBLN, **kwargs) -> torch.Tensor:
+        input_ids = model_input.input_tokens
+        cache_position = model_input.input_positions
+        block_tables = model_input.block_tables
+
+        request_nums = input_ids.shape[0]
+        finished_requests_ids = model_input.finished_requests_ids
+        running_requests_ids = model_input.running_requests_ids
+
+        if envs.VLLM_USE_V1:
+            is_prompt = model_input.is_prompt
+        else:
+            is_prompt = model_input.sampling_metadata.num_prompts > 0
+
+        if is_prompt:
+            image_input = None
+            video_input = None
+            if model_input.multi_modal_kwargs:
+                image_input = self._parse_and_validate_image_input(
+                    **model_input.multi_modal_kwargs
+                )
+                video_input = self._parse_and_validate_video_input(
+                    **model_input.multi_modal_kwargs
+                )
+
+            cur_request_id = running_requests_ids[0]
+            attention_mask = torch.ones_like(input_ids)
+
+            inputs_embeds, position_embed, rope_deltas = self.preprocess_prefill(
+                input_ids, attention_mask, image_input, video_input
+            )
+
+            if finished_requests_ids:
+                for request_id in finished_requests_ids:
+                    self.rope_deltas.pop(request_id, None)
+            self.rope_deltas[cur_request_id] = rope_deltas.item()
+
+        kwargs_dec = self.preprocess_for_decoder(
+            is_prompt, block_tables, input_ids, cache_position
+        )
+        cache_position = kwargs_dec.pop("cache_position")
+        block_tables = kwargs_dec.pop("block_tables")
+
+        if is_prompt:
+            logits = self.model.prefill_decoder(
+                inputs_embeds=inputs_embeds,
+                cache_position=cache_position,
+                position_embed=position_embed,
+                block_tables=block_tables,
+            ).logits
+        else:
+            padded_batch_size = kwargs_dec.pop(
+                "padded_batch_size", self.decoder_batch_size
+            )
+            self.model.decoder = self.model.decoders[padded_batch_size]
+            input_ids = kwargs_dec.pop("input_ids")
+
+            inputs_embeds, position_embed = self._preprocess_embeds(
+                input_ids, cache_position, running_requests_ids, padded_batch_size
+            )
+            logits = self.model.decoder(
+                inputs_embeds=inputs_embeds,
+                cache_position=cache_position,
+                position_embed=position_embed,
+                block_tables=block_tables,
+            ).logits
+
+        if not is_prompt:
+            logits = logits[:request_nums]
+        return logits

@@ -40,6 +40,13 @@ def register_model():
             "Gemma3ForConditionalGeneration",
             "vllm_rbln.model_executor.models.optimum.gemma3:RBLNOptimumGemma3ForConditionalGeneration",
         )
+        # Qwen3.5-MoE: route both vLLM ModelRegistry and the multimodal processor
+        # to our wrapper class so registrations stay scoped to one architecture
+        # rather than the generic TransformersMultiModalForCausalLM.
+        ModelRegistry.register_model(
+            "Qwen3_5MoeForConditionalGeneration",
+            "vllm_rbln.model_executor.models.optimum.qwen_vl:RBLNOptimumQwen3_5MoeForConditionalGeneration",
+        )
 
 
 def register_ops():

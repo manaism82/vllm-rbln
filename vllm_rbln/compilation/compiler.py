@@ -74,6 +74,7 @@ def compile(
     fullgraph: bool = False,
     compile_context: CompileContext | None = None,
     num_devices: int | None = None,
+    device: int | None = None,
     model_trace_method: str = "",
     process_group_dict: dict[str, list[int]] | None = None,
     guard_filter_fn: Callable | None = None,
@@ -96,6 +97,7 @@ def compile(
 
     set_option("compile_context", compile_context)
     set_option("num_devices", num_devices)
+    set_option("device", device)
     set_option("model_trace_method", model_trace_method)
     set_option("process_group_dict", process_group_dict)
     set_option("guard_filter_fn", guard_filter_fn)

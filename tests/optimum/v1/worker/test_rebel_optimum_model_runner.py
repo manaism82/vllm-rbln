@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import tempfile
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -32,6 +33,7 @@ from vllm.v1.core.sched.output import CachedRequestData
 from vllm.v1.sample.metadata import SamplingMetadata
 
 from vllm_rbln.v1.core.optimum_scheduler import RBLNSchedulerOutput
+from vllm_rbln.v1.worker import optimum_model_runner
 from vllm_rbln.v1.worker.optimum_model_runner import RBLNOptimumModelRunner
 
 from .utils import _schedule_new_request, fake_load_model
@@ -260,3 +262,39 @@ def test_update_states_request_unscheduled(model_runner):
 
     assert _is_req_added(model_runner, new_req_id)
     assert _is_req_scheduled(model_runner, new_req_id)
+
+
+@pytest.mark.parametrize(
+    ("rbln_config", "sampler_device"),
+    [
+        pytest.param(
+            {"device": list(range(8, 16)), "visual": {"device": [12, 13]}},
+            8,
+            id="device-list",
+        ),
+        pytest.param({"device": 5}, 5, id="device-int"),
+        pytest.param({}, 0, id="device-absent"),
+        pytest.param(
+            {"language_model": {"device": [4, 5]}, "device": [0, 1]},
+            4,
+            id="language-model-device",
+        ),
+        pytest.param(
+            {"text_model": {"device": 6}, "device": [0, 1]},
+            6,
+            id="text-model-device",
+        ),
+    ],
+)
+def test_rbln_sampler_runs_on_the_first_language_model_device(
+    monkeypatch, rbln_config, sampler_device
+):
+    monkeypatch.setenv("VLLM_RBLN_SAMPLER", "1")
+    sampler_cls = Mock()
+    monkeypatch.setattr(optimum_model_runner, "RBLNSampler", sampler_cls)
+    vllm_config = get_vllm_config()
+    vllm_config.additional_config["rbln_config"] = rbln_config
+
+    RBLNOptimumModelRunner(vllm_config, DEVICE)
+
+    assert sampler_cls.call_args.kwargs["device_id"] == sampler_device

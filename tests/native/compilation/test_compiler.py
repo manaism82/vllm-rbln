@@ -76,6 +76,7 @@ class TestCompileOptions:
         opts = captured_compile["options"]
         for key in (
             "num_devices",
+            "device",
             "model_trace_method",
             "process_group_dict",
             "guard_filter_fn",
@@ -92,6 +93,13 @@ class TestCompileOptions:
         opts = captured_compile["options"]
         assert opts["num_devices"] == 4
         assert opts["model_trace_method"] == "trace"
+
+    @pytest.mark.parametrize("device", [0, 8])
+    def test_device_is_forwarded(self, captured_compile, device):
+        # The backend places the runtime by this option. Device 0 is a choice
+        # like any other, not an unset value to drop.
+        compile(object(), device=device)
+        assert captured_compile["options"]["device"] == device
 
     def test_runtime_holder_uses_underscore_key(self, captured_compile):
         # runtime_holder maps to the "_runtime_holder" option key.

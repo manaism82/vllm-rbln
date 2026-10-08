@@ -18,6 +18,7 @@ import torch
 from vllm.v1.sample.logits_processor import LogitsProcessors
 from vllm.v1.sample.metadata import SamplingMetadata
 
+import vllm_rbln.compilation.compiler as compiler
 from vllm_rbln.v1.sample import rbln_sampler as module
 from vllm_rbln.v1.sample.rbln_sampler import RBLNSampler
 
@@ -110,3 +111,55 @@ def test_all_greedy_batch_takes_the_argmax_op(sampler, op_args):
     # An all-greedy batch skips the top-k/top-p op entirely.
     assert op_args == []
     assert sampled.tolist() == [6, 1]
+
+
+@pytest.fixture
+def compile_options(monkeypatch) -> list[dict]:
+    """Record the options each sampler op reaches torch.compile with."""
+    monkeypatch.setattr(module, "HAS_TORCH_RBLN", True)
+    monkeypatch.setattr(module, "USE_DEVICE_TENSOR", False)
+    # Keep compile() from rewriting the process-wide dynamo config.
+    monkeypatch.setattr(compiler, "_DYNAMO_CONFIGURED", True)
+    recorded: list[dict] = []
+
+    def fake_torch_compile(target, *, backend, dynamic, fullgraph, options):
+        recorded.append(options)
+        return target
+
+    monkeypatch.setattr(torch, "compile", fake_torch_compile)
+    return recorded
+
+
+def test_sampler_ops_compile_on_the_given_device(monkeypatch, compile_options):
+    context = Mock()
+    context_kwargs: list[dict] = []
+
+    def fake_compile_context(**kwargs):
+        context_kwargs.append(kwargs)
+        return context
+
+    monkeypatch.setattr(module.rebel, "CompileContext", fake_compile_context)
+
+    RBLNSampler(device_id=8)
+
+    assert context_kwargs == [{"use_global_ctx": True, "device_id": 8}]
+    # Both the top-k/top-p op and the greedy op.
+    assert len(compile_options) == 2
+    for options in compile_options:
+        assert options["device"] == 8
+        assert options["compile_context"] is context
+        assert options["global_device_id"] == 8
+
+
+def test_sampler_ops_keep_rebels_default_device_without_one(compile_options):
+    # How the native worker builds it: its RBLN_DEVICES is already narrowed to
+    # its own NPUs, and the context it passes lives on device 0.
+    context = Mock()
+
+    RBLNSampler(compile_context=context)
+
+    assert len(compile_options) == 2
+    for options in compile_options:
+        assert "device" not in options
+        assert options["compile_context"] is context
+        assert options["global_device_id"] == 0

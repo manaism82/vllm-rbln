@@ -25,7 +25,7 @@ from vllm.v1.sample.ops.logprobs import batched_count_greater_than
 from vllm.v1.sample.sampler import Sampler as VLLMSampler
 
 import vllm_rbln.envs as envs
-from vllm_rbln.compilation import compile, create_compile_context
+from vllm_rbln.compilation import compile
 from vllm_rbln.logger import init_logger
 from vllm_rbln.platform import HAS_TORCH_RBLN, USE_DEVICE_TENSOR
 from vllm_rbln.v1.sample.ops.top_k_top_p import build_op_top_k_top_p
@@ -67,12 +67,19 @@ def rbln_greedy_sample(logits: torch.Tensor) -> torch.Tensor:
 def compile_sampler(
     op: Callable[..., torch.Tensor],
     compile_context: rebel.CompileContext | None,
+    device_id: int | None = None,
 ) -> Callable[..., torch.Tensor]:
+    # `device_id` indexes the NPUs visible to this process; None keeps rebel's
+    # default, device 0. With rebel-compiler 0.11.2 the runtime lands on the
+    # torch.compile `device` option (global_device_id does not move it), so the
+    # default is the first visible NPU: right for a worker whose RBLN_DEVICES
+    # is narrowed to its own NPUs, wrong for one that sees the whole host. The
+    # global compile context, which rebel keys per device, and
+    # `global_device_id` follow the same device, so a `compile_context` passed
+    # in must have been built for it too.
     compile_context = (
         compile_context
-        or create_compile_context(
-            use_global_ctx=True,
-        )
+        or rebel.CompileContext(use_global_ctx=True, device_id=device_id or 0)
         if not USE_DEVICE_TENSOR
         else None
     )
@@ -82,10 +89,13 @@ def compile_sampler(
         fullgraph=True,
         compile_context=compile_context,
         num_devices=1 if USE_DEVICE_TENSOR or HAS_TORCH_RBLN else None,
+        device=device_id if HAS_TORCH_RBLN and not USE_DEVICE_TENSOR else None,
         model_trace_method="export" if USE_DEVICE_TENSOR else "",
         mode="strict" if envs.VLLM_RBLN_COMPILE_STRICT_MODE else "",
         use_global_ctx=True if HAS_TORCH_RBLN and not USE_DEVICE_TENSOR else None,
-        global_device_id=0 if HAS_TORCH_RBLN and not USE_DEVICE_TENSOR else None,
+        global_device_id=(
+            (device_id or 0) if HAS_TORCH_RBLN and not USE_DEVICE_TENSOR else None
+        ),
         # FIXME: Currently, sampler ops do not support caching.
         # Reusing seed buffer is not supported when the compiled sampler is loaded.
         use_cache=False,
@@ -97,6 +107,7 @@ class RBLNTopKTopPSampler(nn.Module):
         self,
         logprobs_mode: LogprobsMode = "raw_logprobs",
         compile_context: rebel.CompileContext | None = None,
+        device_id: int | None = None,
     ):
         # TODO(rbln): Merge more ops to rbln context.
         #       Currently, we only have softmax in rbln context.
@@ -108,7 +119,7 @@ class RBLNTopKTopPSampler(nn.Module):
         )
 
         self._compiled_rbln_topk_topp_sampler = compile_sampler(
-            rbln_top_k_top_p_sample, compile_context
+            rbln_top_k_top_p_sample, compile_context, device_id
         )
 
     def forward(
@@ -138,20 +149,21 @@ class RBLNSampler(VLLMSampler):
         logprobs_mode: LogprobsMode = "raw_logprobs",
         use_fp64_gumbel: bool = False,
         compile_context: rebel.CompileContext | None = None,
+        device_id: int | None = None,
     ):
         super().__init__(logprobs_mode=logprobs_mode, use_fp64_gumbel=use_fp64_gumbel)
 
         compile_context = (
             compile_context
-            or create_compile_context(
-                use_global_ctx=True,
-            )
+            or rebel.CompileContext(use_global_ctx=True, device_id=device_id or 0)
             if not USE_DEVICE_TENSOR
             else None
         )
         if logprobs_mode in ("raw_logprobs", "raw_logits"):
             self.topk_topp_sampler = RBLNTopKTopPSampler(
-                logprobs_mode=logprobs_mode, compile_context=compile_context
+                logprobs_mode=logprobs_mode,
+                compile_context=compile_context,
+                device_id=device_id,
             )
         else:
             logger.warning_once(
@@ -160,7 +172,7 @@ class RBLNSampler(VLLMSampler):
             )
 
         self._compiled_greedy_sample = compile_sampler(
-            rbln_greedy_sample, compile_context
+            rbln_greedy_sample, compile_context, device_id
         )
 
     def greedy_sample(self, logits: torch.Tensor) -> torch.Tensor:

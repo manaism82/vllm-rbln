@@ -195,11 +195,26 @@ class RBLNOptimumModelRunner(
                 "Set VLLM_RBLN_SAMPLER=0 to use the CPU sampler, which "
                 "supports fp64 Gumbel-noise sampling."
             )
-            logger.info("Using RBLN sampler: %s", self.use_rbln_sampler)
+            # Unlike the native worker, this path does not narrow RBLN_DEVICES
+            # to the worker's own NPUs: rbln_config `device` places the model,
+            # and its ids index every NPU visible to the process. The sampler's
+            # device id lives in the same space, so rebel's default, device 0,
+            # would put it on another instance's NPU when instances split a
+            # host. Use the language model's first NPU; a `language_model` /
+            # `text_model` submodule's own `device` overrides the top-level one,
+            # as it does in optimum-rbln.
+            rbln_config = vllm_config.additional_config.get("rbln_config", {})
+            lm_rbln_config = (
+                rbln_config.get("language_model") or rbln_config.get("text_model") or {}
+            )
+            lm_device = lm_rbln_config.get("device", rbln_config.get("device", 0))
+            sampler_device = lm_device[0] if isinstance(lm_device, list) else lm_device
+            logger.info("Using RBLN sampler on device %d", sampler_device)
             self.pooled_tensors: dict[int, torch.Tensor] = {}
             sampler = RBLNSampler(
                 logprobs_mode=self.model_config.logprobs_mode,
                 use_fp64_gumbel=False,
+                device_id=sampler_device,
             )
         else:
             logger.info("Using default vLLM sampler.")

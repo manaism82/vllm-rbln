@@ -469,3 +469,17 @@ class RBLNOptimumQwen3_5ForConditionalGeneration(
             block_tables=kw.pop("block_tables"),
         ).logits
         return logits[batch_indices]
+
+
+class RBLNOptimumQwen3_5MoeForConditionalGeneration(
+    RBLNOptimumQwen3_5ForConditionalGeneration
+):
+    """
+    Vision-language Qwen3.5-MoE (e.g. Qwen3.5-35B-A3B, Qwen3.6-35B-A3B) for RBLN.
+
+    Identical to Qwen3.5 from the serving side: the sparse MoE blocks are lowered
+    inside the compiled language model, so the linear-attention state slotting,
+    mRoPE handling and multimodal prefill path are all shared with Qwen3.5.
+    """
+
+    pass

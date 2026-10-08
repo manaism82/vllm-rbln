@@ -71,3 +71,8 @@ def get_param_qwen3_5(
     )
     param["attn_impl"] = "flash_attn"
     return param
+
+
+# Qwen3.5-MoE (e.g. Qwen3.5/3.6-35B-A3B) shares the hybrid Qwen3.5 backbone; the
+# MoE blocks live inside the compiled graph, so the compile params are identical.
+get_param_qwen3_5_moe = get_param_qwen3_5

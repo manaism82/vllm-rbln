@@ -1,0 +1,95 @@
+# Copyright 2025 Rebellions Inc. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at:
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from vllm_rbln.logger import init_logger
+from vllm_rbln.patches.registry import add_registration
+
+logger = init_logger(__name__)
+
+
+def _register_oot(base_cls, rbln_cls) -> None:
+    base_cls.register_oot(rbln_cls)
+    logger.debug(
+        "Registered RBLN OOT implementation: %s -> %s",
+        base_cls.__name__,
+        rbln_cls.__name__,
+    )
+
+
+def _register_fp8_block_kernel() -> None:
+    from vllm.model_executor.kernels import linear
+    from vllm.platforms import PlatformEnum
+
+    from vllm_rbln.model_executor.kernels.linear.block_fp8 import (
+        RBLNW8A8BlockFp8LinearKernel,
+        RBLNW8A16BlockFp8LinearKernel,
+    )
+
+    block_kernels = linear._POSSIBLE_FP8_BLOCK_KERNELS.setdefault(PlatformEnum.OOT, [])
+    for kernel_cls in (RBLNW8A16BlockFp8LinearKernel, RBLNW8A8BlockFp8LinearKernel):
+        if kernel_cls not in block_kernels:
+            block_kernels.insert(0, kernel_cls)
+
+
+def _register_unpacked_wna16_linear_kernel() -> None:
+    from vllm.model_executor.kernels import linear
+    from vllm.platforms import PlatformEnum
+
+    from vllm_rbln.model_executor.kernels.linear.mixed_precision.unpacked_wna16 import (
+        RBLNUnpackedwNa16LinearKernel,
+    )
+
+    kernels = linear._POSSIBLE_KERNELS.setdefault(PlatformEnum.OOT, [])
+    if RBLNUnpackedwNa16LinearKernel not in kernels:
+        kernels.insert(0, RBLNUnpackedwNa16LinearKernel)
+
+        logger.debug(
+            "Registered RBLN unpacked wna16 linear kernel for OOT platform: %s",
+            RBLNUnpackedwNa16LinearKernel.__name__,
+        )
+
+
+@add_registration(reason="Register RBLN OOT implementations.")
+def register_rbln_oot_implementations() -> None:
+    from vllm_rbln.model_executor.layers.fused_moe.runner.moe_runner import (
+        MoERunner,
+        RBLNMoERunner,
+    )
+    from vllm_rbln.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
+        RBLNUnquantizedFusedMoEMethod,
+        UnquantizedFusedMoEMethod,
+    )
+    from vllm_rbln.model_executor.layers.mla import (
+        MultiHeadLatentAttentionWrapper,
+        RBLNMultiHeadLatentAttentionWrapper,
+    )
+    from vllm_rbln.model_executor.layers.rotary_embedding.deepseek_scaling_rope import (
+        DeepseekScalingRotaryEmbedding,
+        RBLNDeepseekScalingRotaryEmbedding,
+    )
+    from vllm_rbln.model_executor.layers.vocab_parallel_embedding import (
+        ParallelLMHead,
+        RBLNParallelLMHead,
+        RBLNVocabParallelEmbedding,
+        VocabParallelEmbedding,
+    )
+
+    _register_oot(MoERunner, RBLNMoERunner)
+    _register_oot(UnquantizedFusedMoEMethod, RBLNUnquantizedFusedMoEMethod)
+    _register_oot(VocabParallelEmbedding, RBLNVocabParallelEmbedding)
+    _register_oot(ParallelLMHead, RBLNParallelLMHead)
+    _register_oot(MultiHeadLatentAttentionWrapper, RBLNMultiHeadLatentAttentionWrapper)
+    _register_oot(DeepseekScalingRotaryEmbedding, RBLNDeepseekScalingRotaryEmbedding)
+    _register_fp8_block_kernel()
+    _register_unpacked_wna16_linear_kernel()

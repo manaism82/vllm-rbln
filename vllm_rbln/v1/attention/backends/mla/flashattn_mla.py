@@ -25,76 +25,19 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.attention.backends.registry import AttentionBackendEnum, register_backend
 
-import vllm_rbln.rbln_envs as envs
+import vllm_rbln.envs as envs
 from vllm_rbln.logger import init_logger
 
+from ...ops.flash_causal_mla_naive import (
+    paged_flash_causal_mla_naive_decode,
+    paged_flash_causal_mla_naive_prefill,
+)
 from ..flash_attention import (
     RBLNFlashAttentionMetadata,
     RBLNFlashAttentionMetadataBuilder,
 )
 
 logger = init_logger(__name__)
-
-
-# ---------------------------------------------------------------------------
-# Custom ops (stubs for torch.compile — actual kernel provided by RBLN runtime)
-# ---------------------------------------------------------------------------
-
-
-def _fake_mla_output(q: torch.Tensor, kv_c_normed: torch.Tensor) -> torch.Tensor:
-    """Return shape: [batch, num_heads, seq_len, kv_lora_rank]."""
-    b, num_heads, seq_len, _ = q.shape
-    kv_lora_rank = kv_c_normed.shape[-1]
-    return torch.empty(
-        (b, num_heads, seq_len, kv_lora_rank), device=q.device, dtype=q.dtype
-    )
-
-
-@torch.library.custom_op(
-    "rbln_custom_ops::paged_flash_causal_mla_naive_prefill",
-    mutates_args=["kv_cache"],
-)
-def paged_flash_causal_mla_naive_prefill_impl(
-    q: torch.Tensor,
-    kv_c_normed: torch.Tensor,
-    k_pe: torch.Tensor,
-    kv_cache: torch.Tensor,
-    seq_idx: torch.Tensor,
-    block_tables: torch.Tensor,
-    scale: torch.Tensor,
-) -> torch.Tensor:
-    return _fake_mla_output(q, kv_c_normed)
-
-
-@torch.library.register_fake("rbln_custom_ops::paged_flash_causal_mla_naive_prefill")
-def _(q, kv_c_normed, k_pe, kv_cache, seq_idx, block_tables, scale):
-    return _fake_mla_output(q, kv_c_normed)
-
-
-@torch.library.custom_op(
-    "rbln_custom_ops::paged_flash_causal_mla_naive_decode",
-    mutates_args=["kv_cache"],
-)
-def paged_flash_causal_mla_naive_decode_impl(
-    q: torch.Tensor,
-    kv_c_normed: torch.Tensor,
-    k_pe: torch.Tensor,
-    kv_cache: torch.Tensor,
-    seq_idx: torch.Tensor,
-    block_tables: torch.Tensor,
-    scale: torch.Tensor,
-) -> torch.Tensor:
-    return _fake_mla_output(q, kv_c_normed)
-
-
-@torch.library.register_fake("rbln_custom_ops::paged_flash_causal_mla_naive_decode")
-def _(q, kv_c_normed, k_pe, kv_cache, seq_idx, block_tables, scale):
-    return _fake_mla_output(q, kv_c_normed)
-
-
-# ---------------------------------------------------------------------------
-# Backend / Impl
-# ---------------------------------------------------------------------------
 
 
 @register_backend(AttentionBackendEnum.FLASH_ATTN_MLA)
@@ -107,7 +50,7 @@ class RBLNFlashAttnMLABackend(MLACommonBackend):
 
     @staticmethod
     def get_name() -> str:
-        return "RBLN_FLASH_ATTN_MLA"
+        return "FLASH_ATTN_MLA"
 
     @staticmethod
     def get_builder_cls() -> type["RBLNFlashAttentionMetadataBuilder"]:
@@ -280,9 +223,9 @@ class RBLNFlashAttnMLAImpl(MLAAttentionImpl[RBLNFlashAttentionMetadata]):
 
         # Dispatch to custom kernel
         if attn_metadata.is_prefill:
-            kernel = torch.ops.rbln_custom_ops.paged_flash_causal_mla_naive_prefill
+            kernel = paged_flash_causal_mla_naive_prefill
         else:
-            kernel = torch.ops.rbln_custom_ops.paged_flash_causal_mla_naive_decode
+            kernel = paged_flash_causal_mla_naive_decode
 
         attn_output = kernel(
             q,

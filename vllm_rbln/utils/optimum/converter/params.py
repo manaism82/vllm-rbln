@@ -86,6 +86,7 @@ class RBLNParams:
     max_seq_len: int | None = None
     kvcache_block_size: int | None = None
     prefill_chunk_size: int = 128
+    num_devices: int = 1
     # Image-prefill buckets for multimodal models (gemma3: single value;
     # gemma4: descending list of 128-multiples). None for non-multimodal models.
     image_prefill_chunk_size: list[int] | None = None
@@ -97,7 +98,6 @@ class RBLNParams:
     ) -> "RBLNParams":
         """Parse rbln_config according to the model architecture."""
         hf_config = vllm_config.model_config.hf_config
-        tensor_parallel_size = _cfg_get(rbln_config, "tensor_parallel_size", 1)
 
         if is_enc_dec_arch(hf_config):
             params = cls._parse_enc_dec(rbln_config)
@@ -108,7 +108,7 @@ class RBLNParams:
         else:
             params = cls._parse_decoder(rbln_config)
 
-        params.tensor_parallel_size = tensor_parallel_size
+        params.num_devices = _resolve_num_devices(rbln_config)
         return params
 
     @classmethod
@@ -146,12 +146,15 @@ class RBLNParams:
     @classmethod
     def _parse_decoder(cls, cfg: RblnConfigLike) -> "RBLNParams":
         kvcache_block_size = _resolve_kvcache_block_size(cfg, arch="decoder")
+        default_prefill_chunk_size = _resolve_default_prefill_chunk_size()
         return cls(
             num_blocks=_cfg_get(cfg, "kvcache_num_blocks"),
             batch_size=_cfg_get(cfg, "batch_size"),
             max_seq_len=_cfg_get(cfg, "max_seq_len"),
             kvcache_block_size=kvcache_block_size,
-            prefill_chunk_size=_cfg_get(cfg, "prefill_chunk_size", 128),
+            prefill_chunk_size=_cfg_get(
+                cfg, "prefill_chunk_size", default_prefill_chunk_size
+            ),
         )
 
     @classmethod
@@ -160,6 +163,7 @@ class RBLNParams:
         batch_size = _cfg_get(cfg, "batch_size")
         max_seq_len = _cfg_get(cfg, "max_seq_len")
         num_blocks = _cfg_get(cfg, "kvcache_num_blocks")
+        default_prefill_chunk_size = _resolve_default_prefill_chunk_size()
         # Fall back to a known submodule when the main module does not expose
         # these fields (e.g. language_model / text_model for some VLMs).
         if kvcache_block_size is None:
@@ -187,7 +191,9 @@ class RBLNParams:
                 break
         prefill_chunk_size = _cfg_get(lm_cfg, "prefill_chunk_size")
         if prefill_chunk_size is None:
-            prefill_chunk_size = _cfg_get(cfg, "prefill_chunk_size", 128)
+            prefill_chunk_size = _cfg_get(
+                cfg, "prefill_chunk_size", default_prefill_chunk_size
+            )
         image_prefill_chunk_size = _resolve_image_prefill_chunk_size(lm_cfg)
         if image_prefill_chunk_size is None:
             image_prefill_chunk_size = _resolve_image_prefill_chunk_size(cfg)
@@ -200,6 +206,38 @@ class RBLNParams:
             prefill_chunk_size=prefill_chunk_size,
             image_prefill_chunk_size=image_prefill_chunk_size,
         )
+
+
+def _num_devices_of(cfg: RblnConfigLike) -> int | None:
+    val = _cfg_get(cfg, "num_devices")
+    if val is not None:
+        assert isinstance(val, int), (
+            f"num_devices must be an int, got {type(val).__name__}"
+        )
+        assert val > 0, "num_devices must be a positive integer"
+        return val
+    compile_cfgs = _cfg_get(cfg, "_compile_cfgs")
+    if isinstance(compile_cfgs, list):
+        for entry in compile_cfgs:
+            entry_val = _cfg_get(entry, "num_devices")
+            if entry_val is not None:
+                assert isinstance(entry_val, int), (
+                    f"num_devices must be an int, got {type(entry_val).__name__}"
+                )
+                assert entry_val > 0, "num_devices must be a positive integer"
+                return entry_val
+    return None
+
+
+def _resolve_num_devices(cfg: RblnConfigLike) -> int:
+    for submodule_name in ("language_model", "text_model"):
+        sub_cfg = _cfg_get_submodule(cfg, submodule_name)
+        if sub_cfg is None:
+            continue
+        sub_val = _num_devices_of(sub_cfg)
+        if sub_val is not None:
+            return sub_val
+    return _num_devices_of(cfg) or 1
 
 
 def _resolve_image_prefill_chunk_size(cfg: RblnConfigLike) -> list[int] | None:
@@ -242,3 +280,22 @@ def _resolve_kvcache_block_size(cfg: RblnConfigLike, *, arch: str) -> int | None
         "Please check the values in rbln_config.json"
     )
     return kvcache_block_size
+
+
+_PREFILL_CHUNK_SIZE_BY_FAMILY = {
+    "ca": 128,  # ATOM
+    "cr": 512,  # REBEL
+}
+
+
+def _resolve_default_prefill_chunk_size() -> int:
+    from vllm_rbln.platform import RblnPlatform
+
+    device_name = RblnPlatform.get_device_name().lower()
+    for family, chunk_size in _PREFILL_CHUNK_SIZE_BY_FAMILY.items():
+        if family in device_name:
+            return chunk_size
+    raise RuntimeError(
+        f"Unknown NPU device {device_name!r}; "
+        "expected an ATOM (ca) or REBEL (cr) device."
+    )

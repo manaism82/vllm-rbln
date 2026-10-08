@@ -19,18 +19,15 @@ def get_param_exaone4_5(
     max_model_len: int,
     block_size: int,
     num_devices: int,
+    memory_budget: float,
     prefill_chunk_size: int | None = None,
 ) -> dict:
-    param = {
-        "visual": {
-            # if tensor_parallel_size of submodule is not specified,
-            # it inherits tensor_parallel_size of main module.
-            "max_seq_len": 6400,
-        },
+    param: dict = {
         "num_devices": num_devices,
         "max_seq_len": max_model_len,
         "batch_size": batch_size,
         "use_inputs_embeds": True,
+        "memory_budget": memory_budget,
     }
     if block_size != max_model_len:
         attn_impl = "flash_attn" if block_size != max_model_len else "eager"

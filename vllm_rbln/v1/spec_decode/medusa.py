@@ -1,37 +1,58 @@
 # Copyright 2025 Rebellions Inc. All rights reserved.
-
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at:
-
+#
 #     http://www.apache.org/licenses/LICENSE-2.0
-
+#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import os
-from copy import copy
+from typing import TYPE_CHECKING
 
 import torch
 import torch.nn as nn
-from rebel import CompileContext
 from vllm.config import VllmConfig
-from vllm.distributed import get_dp_group, get_pp_group, get_tp_group
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.spec_decode.medusa import MedusaProposer
 
-import vllm_rbln.rbln_envs as envs
-from vllm_rbln.forward_context import set_forward_context
-from vllm_rbln.torch_compile_backend import logged_rbln_backend
+import vllm_rbln.envs as envs
+from vllm_rbln.compilation import (
+    build_process_group_dict,
+    compile,
+    create_compile_context,
+)
+from vllm_rbln.platform import USE_DEVICE_TENSOR
+
+if TYPE_CHECKING:
+    from rebel.compile_context import CompileContext
 
 
 class RBLNMedusaProposer(MedusaProposer):
-    def __init__(self, vllm_config: VllmConfig, device: torch.device) -> None:
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        device: torch.device,
+        compile_context: "CompileContext | None" = None,
+    ) -> None:
         super().__init__(vllm_config, device)
 
-        self.compile_context = CompileContext(use_weight_sharing=True)
+        self.max_num_seqs = self.vllm_config.scheduler_config.max_num_seqs
+        self.hidden_states = torch.zeros(
+            self.max_num_seqs, self.hidden_size, device=self.device, dtype=self.dtype
+        )
+        self.compile_context = (
+            compile_context
+            or create_compile_context(
+                use_weight_sharing=True,
+                use_global_ctx=True,
+            )
+            if not USE_DEVICE_TENSOR
+            else None
+        )
 
     def load_model(self, target_model: nn.Module) -> None:
         super().load_model(target_model)
@@ -47,63 +68,37 @@ class RBLNMedusaProposer(MedusaProposer):
         ):
             self.model_executable = model_wrapper
         else:
-            self.model_executable = self._compile_model(model_wrapper)
-
-    def _compile_model(self, model: nn.Module):
-        TP = get_tp_group()
-        PP = get_pp_group()
-        DP = get_dp_group()
-
-        process_group_dict = {}
-        process_group_dict[TP.device_group.group_name] = TP.ranks
-        process_group_dict[TP.cpu_group.group_name] = TP.ranks
-        process_group_dict[PP.device_group.group_name] = PP.ranks
-        process_group_dict[PP.cpu_group.group_name] = PP.ranks
-        process_group_dict[DP.device_group.group_name] = DP.ranks
-        process_group_dict[DP.cpu_group.group_name] = DP.ranks
-
-        options = {
-            "compile_context": self.compile_context,
-            "tensor_parallel_size": envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK,
-            "process_group_dict": process_group_dict,
-            "guard_filter_fn": torch.compiler.keep_tensor_guards_unsafe,
-            "mode": "strict",
-        }
-        if envs.VLLM_RBLN_USE_DEVICE_TENSOR:
-            options["model_trace_method"] = "export"
-        if not envs.VLLM_DISABLE_COMPILE_CACHE:
-            options["cache_dir"] = os.path.join(envs.VLLM_CACHE_ROOT, "rbln")
-        if envs.VLLM_RBLN_COMPILE_ONLY:
-            options["mode"] = ["strict", "compile_only"]
-
-        return torch.compile(
-            model,
-            backend=logged_rbln_backend,
-            options=copy(options),
-            dynamic=False,
-        )
+            self.model_executable = compile(
+                model_wrapper,
+                dynamic=False,
+                fullgraph=True,
+                compile_context=self.compile_context,
+                num_devices=envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK,
+                model_trace_method="export" if USE_DEVICE_TENSOR else "",
+                process_group_dict=build_process_group_dict(),
+                guard_filter_fn=torch.compiler.keep_tensor_guards_unsafe,
+                mode="strict" if envs.VLLM_RBLN_COMPILE_STRICT_MODE else "",
+            )
 
     def propose(
         self,
-        target_hidden_states: torch.Tensor,
+        target_hidden_states: torch.Tensor,  # [B, H]
         sampling_metadata: SamplingMetadata,
     ) -> torch.Tensor:
+        batch_size = target_hidden_states.shape[0]
+        self.hidden_states[:batch_size] = target_hidden_states
+
         # Generate blocks and compute logits
-        logits = self.model_executable(target_hidden_states)
+        logits = self.model_executable(self.hidden_states)
 
         # Compute argmax for each Medusa head and stack into a single tensor
         # Shape: [batch_size, num_heads]
-        draft_tokens = torch.stack([logit.argmax(dim=-1) for logit in logits], dim=1)
+        draft_tokens = torch.stack(
+            [logit[:batch_size].argmax(dim=-1) for logit in logits], dim=1
+        )
 
         return draft_tokens
 
     @torch.inference_mode()
-    def dummy_run(self, batch_size: int) -> None:
-        hidden_states = torch.zeros(
-            (batch_size, self.hidden_size),
-            dtype=self.dtype,
-            device=self.device,
-        )
-
-        with set_forward_context(None, self.vllm_config, num_tokens=batch_size):
-            self.model(hidden_states)
+    def dummy_run(self) -> None:
+        self.model_executable(self.hidden_states)

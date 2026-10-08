@@ -14,15 +14,14 @@
 
 import os
 from collections import defaultdict
-from dataclasses import dataclass, field
-from typing import TypeVar
+from dataclasses import dataclass, field, replace
 
-import vllm_rbln.rbln_envs as envs
+import numpy as np
+
+from vllm_rbln import envs
 from vllm_rbln.logger import init_logger, make_file_handler
 
 logger = init_logger(__name__)
-
-T = TypeVar("T", int, float)
 
 _metrics_file_attached = False
 
@@ -79,106 +78,84 @@ class StepMetrics:
         if prepare_time is not None:
             self.prepare_times.append(prepare_time)
 
-    def _without_outlier(self, values: list[T]) -> list[T]:
-        """Return values excluding one outlier (max absolute deviation)."""
-        if len(values) <= 1:
-            return values
-        mean = sum(values) / len(values)
-        deviations = [abs(v - mean) for v in values]
-        max_idx = deviations.index(max(deviations))
-        return [v for i, v in enumerate(values) if i != max_idx]
-
-    def get_avg_latency(self, ignore_outlier: bool = True) -> float:
-        """Get average latency in milliseconds,
-        optionally ignoring one outlier."""
-        values = (
-            self._without_outlier(self.latencies) if ignore_outlier else self.latencies
-        )
-        return sum(values) / len(values) * 1000 if values else 0.0
-
-    def get_avg_throughput(self, ignore_outlier: bool = True) -> float:
-        """Get average throughput in tokens/second,
-        optionally ignoring one outlier."""
-        if not self.latencies or not self.token_counts:
+    def get_avg_latency(self) -> float:
+        """Mean per-step latency in milliseconds (no outlier removal)."""
+        if not self.latencies:
             return 0.0
-        latencies = (
-            self._without_outlier(self.latencies) if ignore_outlier else self.latencies
-        )
-        tokens = (
-            self._without_outlier(self.token_counts)
-            if ignore_outlier
-            else self.token_counts
-        )
-        total_time = sum(latencies)
-        total_tokens = sum(tokens)
-        return total_tokens / total_time if total_time > 0 else 0.0
+        return sum(self.latencies) / len(self.latencies) * 1000
 
-    def get_avg_host_time(self, ignore_outlier: bool = True) -> float:
-        """Get average host time in microseconds,
-        optionally ignoring one outlier."""
-        values = (
-            self._without_outlier(self.host_times)
-            if ignore_outlier
-            else self.host_times
-        )
-        return sum(values) / len(values) if values else 0.0
+    def get_latency_percentiles(
+        self, percentiles: tuple[float, ...] = (50.0, 90.0, 99.0)
+    ) -> dict[str, float]:
+        """Latency percentiles and max in milliseconds (empty if no data)."""
+        if not self.latencies:
+            return {}
+        arr = np.asarray(self.latencies, dtype=float) * 1000.0
+        stats = {f"p{p:g}": float(np.percentile(arr, p)) for p in percentiles}
+        stats["max"] = float(arr.max())
+        return stats
 
-    def get_avg_device_time(self, ignore_outlier: bool = True) -> float:
-        """Get average device time in microseconds,
-        optionally ignoring one outlier."""
-        values = (
-            self._without_outlier(self.device_times)
-            if ignore_outlier
-            else self.device_times
-        )
-        return sum(values) / len(values) if values else 0.0
+    def get_avg_throughput(self) -> float:
+        """Aggregate throughput in tokens/second (total tokens / total time)."""
+        total_time = sum(self.latencies)
+        return sum(self.token_counts) / total_time if total_time > 0 else 0.0
 
-    def get_avg_ccl_time(self, ignore_outlier: bool = True) -> float:
-        """Get average ccl time in microseconds,
-        optionally ignoring one outlier."""
-        values = (
-            self._without_outlier(self.ccl_times) if ignore_outlier else self.ccl_times
-        )
-        return sum(values) / len(values) if values else 0.0
+    def get_avg_host_time(self) -> float:
+        """Mean host time in microseconds."""
+        return sum(self.host_times) / len(self.host_times) if self.host_times else 0.0
 
-    def get_avg_prepare_time(self, ignore_outlier: bool = True) -> float:
-        """Get average prepare time (PrepareInputs + PrepareOutputs around Run)
-        in microseconds, optionally ignoring one outlier."""
-        values = (
-            self._without_outlier(self.prepare_times)
-            if ignore_outlier
-            else self.prepare_times
+    def get_avg_device_time(self) -> float:
+        """Mean device time in microseconds."""
+        return (
+            sum(self.device_times) / len(self.device_times)
+            if self.device_times
+            else 0.0
         )
-        return sum(values) / len(values) if values else 0.0
+
+    def get_avg_ccl_time(self) -> float:
+        """Mean ccl time in microseconds."""
+        return sum(self.ccl_times) / len(self.ccl_times) if self.ccl_times else 0.0
+
+    def get_avg_prepare_time(self) -> float:
+        """Mean prepare time (PrepareInputs + PrepareOutputs around Run), us."""
+        return (
+            sum(self.prepare_times) / len(self.prepare_times)
+            if self.prepare_times
+            else 0.0
+        )
 
     def get_call_counts(self) -> int:
         """Get total number of requests processed."""
         return len(self.latencies)
 
     def show_stats(self, stat_type: str):
-        if self.get_call_counts() > 0:
-            logger.info("%s METRICS:", stat_type)
-            logger.info("  Total call counts: %d", self.get_call_counts())
-            logger.info("  Average latency: %.2f ms", self.get_avg_latency())
-            if sum(self.token_counts) > 0:
-                logger.info("  Total tokens processed: %d", sum(self.token_counts))
-                logger.info(
-                    "  Average throughput: %.2f tokens/sec", self.get_avg_throughput()
-                )
-            if self.host_times:
-                logger.info("  Average host time: %.2f us", self.get_avg_host_time())
-            if self.device_times:
-                logger.info(
-                    "  Average device time: %.2f us", self.get_avg_device_time()
-                )
-            if self.ccl_times:
-                logger.info("  Average ccl time: %.2f us", self.get_avg_ccl_time())
-            if self.prepare_times:
-                logger.info(
-                    "  Average prepare time: %.2f us", self.get_avg_prepare_time()
-                )
-        else:
+        if self.get_call_counts() <= 0:
             logger.info("%s METRICS: No data recorded", stat_type)
+            return
+        pct = self.get_latency_percentiles()
+        logger.info("%s METRICS:", stat_type)
+        logger.info("  Total call counts: %d", self.get_call_counts())
+        logger.info(
+            "  Latency (ms): mean %.2f | p50 %.2f | p90 %.2f | p99 %.2f | max %.2f",
+            self.get_avg_latency(),
+            pct["p50"],
+            pct["p90"],
+            pct["p99"],
+            pct["max"],
+        )
+        if sum(self.token_counts) > 0:
+            logger.info("  Total tokens processed: %d", sum(self.token_counts))
+            logger.info(
+                "  Average throughput: %.2f tokens/sec", self.get_avg_throughput()
+            )
+        if self.host_times:
+            logger.info("  Average host time: %.2f us", self.get_avg_host_time())
+        if self.device_times:
+            logger.info("  Average device time: %.2f us", self.get_avg_device_time())
+        if self.ccl_times:
+            logger.info("  Average ccl time: %.2f us", self.get_avg_ccl_time())
+        if self.prepare_times:
+            logger.info("  Average prepare time: %.2f us", self.get_avg_prepare_time())
 
 
 class PrefillMetricsByRequestID:
@@ -211,6 +188,13 @@ class PrefillMetricsByRequestID:
         """Get average latency per request."""
         return {
             request_id: metric.get_avg_latency()
+            for request_id, metric in self.metrics.items()
+        }
+
+    def get_total_latency_per_request(self) -> dict[str, float]:
+        """Total prefill latency per request (sum of its chunk latencies), ms."""
+        return {
+            request_id: sum(metric.latencies) * 1000.0
             for request_id, metric in self.metrics.items()
         }
 
@@ -299,6 +283,45 @@ class PerformanceTracker:
             prepare_time,
         )
 
+    def record(self, report: "StepReport") -> None:
+        if report.is_prefill:
+            self.record_prefill(
+                report.latency,
+                report.token_count,
+                host_time=report.host_time,
+                device_time=report.device_time,
+                ccl_time=report.ccl_time,
+                prepare_time=report.prepare_time,
+                request_ids=report.request_ids,
+            )
+        else:
+            self.record_decode(
+                report.latency,
+                report.token_count,
+                host_time=report.host_time,
+                device_time=report.device_time,
+                ccl_time=report.ccl_time,
+                prepare_time=report.prepare_time,
+                padded_decode=report.padded_decode,
+                request_ids=report.request_ids,
+            )
+
+    def _show_per_request_prefill(self) -> None:
+        """Log per-request prefill latency (sum of each request's chunks)."""
+        totals = list(
+            self.prefill_metrics_by_request_id.get_total_latency_per_request().values()
+        )
+        if not totals:
+            return
+        arr = np.asarray(totals, dtype=float)
+        logger.info(
+            "  Per-request prefill (ms): mean %.2f | p50 %.2f | max %.2f (%d requests)",
+            float(arr.mean()),
+            float(np.percentile(arr, 50)),
+            float(arr.max()),
+            len(totals),
+        )
+
     def print_final_stats(self):
         _attach_metrics_file_handler()
         logger.info("=" * 80)
@@ -310,6 +333,7 @@ class PerformanceTracker:
 
         # Prefill stats
         self.prefill_metrics.show_stats("PREFILL")
+        self._show_per_request_prefill()
         logger.info("-" * 40)
 
         # Decode stats
@@ -321,6 +345,77 @@ class PerformanceTracker:
         logger.info("=" * 80)
 
 
+@dataclass
+class StepReport:
+    """One execution step's timing before it is recorded into a tracker.
+
+    Lets model and sampler timings be summed into a single combined
+    measurement (merged_with) instead of being tracked separately.
+    """
+
+    latency: float
+    token_count: int = 0
+    host_time: int | None = None
+    device_time: int | None = None
+    ccl_time: int | None = None
+    prepare_time: int | None = None
+    is_prefill: bool = False
+    padded_decode: bool = False
+    request_ids: list[str] | None = None
+
+    @classmethod
+    def from_reports(
+        cls,
+        start_time: float,
+        end_time: float,
+        reports: list[dict] | None,
+        *,
+        token_count: int = 0,
+        is_prefill: bool = False,
+        padded_decode: bool = False,
+        request_ids: list[str] | None = None,
+    ) -> "StepReport":
+        host_time = device_time = ccl_time = prepare_time = None
+        if reports:
+            host_time = reports[0].get("total_host", None)
+            device_time = reports[0].get("total_device", None)
+            ccl_time = reports[0].get("total_ccl", None)
+        if reports and len(reports) > 1:
+            prepare_time = reports[1].get("prepare_input_us", 0) + reports[1].get(
+                "prepare_output_us", 0
+            )
+        return cls(
+            latency=end_time - start_time,
+            token_count=token_count,
+            host_time=host_time,
+            device_time=device_time,
+            ccl_time=ccl_time,
+            prepare_time=prepare_time,
+            is_prefill=is_prefill,
+            padded_decode=padded_decode,
+            request_ids=request_ids,
+        )
+
+    def merged_with(self, other: "StepReport | None") -> "StepReport":
+        """Sum `other`'s timings into this step, keeping this step's metadata."""
+        if other is None:
+            return self
+
+        def _add(a: int | None, b: int | None) -> int | None:
+            if a is None and b is None:
+                return None
+            return (a or 0) + (b or 0)
+
+        return replace(
+            self,
+            latency=self.latency + other.latency,
+            host_time=_add(self.host_time, other.host_time),
+            device_time=_add(self.device_time, other.device_time),
+            ccl_time=_add(self.ccl_time, other.ccl_time),
+            prepare_time=_add(self.prepare_time, other.prepare_time),
+        )
+
+
 def collect_metrics(
     performance_tracker: PerformanceTracker,
     is_prefill: bool,
@@ -329,34 +424,12 @@ def collect_metrics(
     reports: list[dict],
     token_count: int,
 ) -> None:
-    execution_time = end_time - start_time
-    host_time = None
-    device_time = None
-    ccl_time = None
-    prepare_time = None
-    if reports is not None and len(reports) > 0:
-        host_time = reports[0].get("total_host", None)
-        device_time = reports[0].get("total_device", None)
-        ccl_time = reports[0].get("total_ccl", None)
-    if reports is not None and len(reports) > 1:
-        prepare_time = reports[1].get("prepare_input_us", 0) + reports[1].get(
-            "prepare_output_us", 0
+    performance_tracker.record(
+        StepReport.from_reports(
+            start_time,
+            end_time,
+            reports,
+            token_count=token_count,
+            is_prefill=is_prefill,
         )
-    if is_prefill:
-        performance_tracker.record_prefill(
-            execution_time,
-            token_count,
-            host_time=host_time,
-            device_time=device_time,
-            ccl_time=ccl_time,
-            prepare_time=prepare_time,
-        )
-    else:
-        performance_tracker.record_decode(
-            execution_time,
-            token_count,
-            host_time=host_time,
-            device_time=device_time,
-            ccl_time=ccl_time,
-            prepare_time=prepare_time,
-        )
+    )

@@ -11,13 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""CPU affinity utilities for RBLN worker."""
+"""Utilities for RBLN worker. (CPU affinity, batch reorder, ...)"""
 
 import math
 import os
 import platform
 from collections import defaultdict
 from collections.abc import Callable
+from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
@@ -29,41 +30,191 @@ from vllm.utils.cpu_resource_utils import (
     get_allowed_cpu_list,
     get_visible_memory_node,
 )
-from vllm.v1.worker.block_table import MultiGroupBlockTable
+from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
+    EncoderOnlyAttentionSpec,
+    KVCacheConfig,
+    MambaSpec,
+    UniformTypeKVCacheSpecs,
+)
+from vllm.v1.worker.utils import AttentionGroup, select_common_block_size
 
-import vllm_rbln.rbln_envs as envs
+from vllm_rbln import envs
 from vllm_rbln.logger import init_logger
+from vllm_rbln.v1.kv_cache import RBLNSlidingWindowSpec
+
+if TYPE_CHECKING:
+    from vllm.v1.worker.gpu_input_batch import InputBatch
 
 logger = init_logger(__name__)
 
+RBLN_SYSFS_CLASS_DIR = "/sys/class/rebellions"
+# sysfs lists every card on the host, /dev only ours; reading sysfs by the raw
+# RBLN_DEVICES entry would charge a neighbouring container's workload to us.
+RBLN_DEV_DIR = "/dev"
 
-def compute_slot_mapping_cpu(
-    block_table: MultiGroupBlockTable,
-    req_indices: np.ndarray,
-    positions_np: np.ndarray,
-    total_num_scheduled_tokens: int,
-) -> None:
-    """Compute slot_mapping on CPU and sync to device.
+# 144 GiB of quad-chiplet DRAM minus the 4 GiB system region
+REBEL_DRAM_NBYTES = 144 * 2**30 - 4 * 2**30
 
-    vLLM 0.19 replaced the numpy slot_mapping path with a Triton kernel that
-    RBLN (CPU) cannot dispatch, so we always compute via numpy and push to
-    device ourselves. The same code works on 0.18 since all referenced
-    buffer attributes (``block_table.np``, ``slot_mapping.np``,
-    ``copy_to_gpu``) exist on both versions.
+
+def get_rbln_visible_card_indices() -> list[int]:
+    """Card indices this process may use, from `RBLN_DEVICES`.
+
+    Unset or empty means every card under /sys/class/rebellions. Prefer
+    `get_rbln_owned_card_indices`; this one reads each entry as a sysfs card
+    name and remains only as the fallback for hosts with no device nodes.
     """
-    num_tokens = req_indices.shape[0]
-    for bt in block_table.block_tables:
-        block_table_indices = (
-            req_indices * bt.max_num_blocks_per_req + positions_np // bt.block_size
+    raw = os.environ.get("RBLN_DEVICES", "")
+    if raw.strip():
+        return sorted(
+            {int(token) for token in raw.replace(",", " ").split() if token.strip()}
         )
-        block_numbers = bt.block_table.np.ravel()[block_table_indices]
-        block_offsets = positions_np % bt.block_size
-        np.add(
-            block_numbers * bt.block_size,
-            block_offsets,
-            out=bt.slot_mapping.np[:num_tokens],
+    if not os.path.isdir(RBLN_SYSFS_CLASS_DIR):
+        return []
+    found: list[int] = []
+    for name in os.listdir(RBLN_SYSFS_CLASS_DIR):
+        if name.startswith("rbln") and name[4:].isdigit():
+            found.append(int(name[4:]))
+    return sorted(found)
+
+
+def _rbln_present_card_indices() -> list[int]:
+    """Physical card indices this process can open, from /dev/rbln*.
+
+    Device nodes keep their host numbering. [] means callers should fall back.
+    """
+    try:
+        names = os.listdir(RBLN_DEV_DIR)
+    except OSError:
+        return []
+    return sorted(
+        int(name[4:])
+        for name in names
+        if name.startswith("rbln") and name[4:].isdigit()
+    )
+
+
+def get_rbln_owned_card_indices() -> list[int]:
+    """sysfs card indices this process owns, with `RBLN_DEVICES` resolved.
+
+    Entry `i` selects the `i`-th present device; a physical name is accepted too,
+    but the positional reading wins when both are possible.
+    """
+    present = _rbln_present_card_indices()
+    if not present:
+        # No device nodes (unit tests, host without the driver): nothing better
+        # is knowable, so keep the previous behaviour exactly.
+        return get_rbln_visible_card_indices()
+    raw = os.environ.get("RBLN_DEVICES", "")
+    if not raw.strip():
+        return present
+    owned: list[int] = []
+    for token in raw.replace(",", " ").split():
+        if not token.strip():
+            continue
+        index = int(token)
+        if 0 <= index < len(present):
+            owned.append(present[index])
+        elif index in present:
+            owned.append(index)
+    return sorted(set(owned)) or present
+
+
+def _read_card_attr_int(card_index: int, attr: str) -> int | None:
+    path = os.path.join(RBLN_SYSFS_CLASS_DIR, f"rbln{card_index}", attr)
+    try:
+        with open(path) as handle:
+            return int(handle.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def read_rbln_card_dram_total_bytes() -> int | None:
+    """Per-card DRAM capacity in bytes, or None when sysfs is unavailable.
+
+    Reads only the cards this process owns; a heterogeneous set is rejected
+    rather than averaged. Clamped to `REBEL_DRAM_NBYTES` here rather than at the
+    call sites, because both of them size real allocations from this number.
+    """
+    values: dict[int, int] = {}
+    for card_index in get_rbln_owned_card_indices():
+        value = _read_card_attr_int(card_index, "dram_total")
+        if value is not None and value > 0:
+            values[card_index] = value
+    if not values:
+        return None
+    distinct = set(values.values())
+    if len(distinct) != 1:
+        raise RuntimeError(
+            "visible RBLN cards report different dram_total values "
+            f"({values}); a single per-chiplet DRAM budget cannot be derived."
         )
-        bt.slot_mapping.copy_to_gpu(total_num_scheduled_tokens)
+    dram_total = next(iter(distinct))
+    if dram_total > REBEL_DRAM_NBYTES:
+        logger.warning(
+            "sysfs reports %d bytes of card DRAM, more than the %d this build "
+            "assumes usable; clamping. Raise REBEL_DRAM_NBYTES if the card is "
+            "genuinely larger.",
+            dram_total,
+            REBEL_DRAM_NBYTES,
+        )
+        return REBEL_DRAM_NBYTES
+    return dram_total
+
+
+def read_rbln_card_dram_used_bytes() -> int:
+    """Largest `dram_used` across the cards we own (0 when sysfs is absent).
+
+    Sampled before this process allocates, so it is what other tenants hold.
+    Card-scope: sysfs has no per-chiplet breakdown, so the caller must scale it
+    before subtracting it from a per-chiplet budget. Cards we do not own are
+    excluded: charging a neighbour's usage cost one run 1024 blocks -> 308.
+    """
+    used = [
+        value
+        for card_index in get_rbln_owned_card_indices()
+        if (value := _read_card_attr_int(card_index, "dram_used")) is not None
+    ]
+    return max(used, default=0)
+
+
+def rescale_kv_cache_config(cfg: KVCacheConfig, num_blocks: int) -> None:
+    """Retarget `cfg` at `num_blocks`, in place.
+
+    `KVCacheTensor.size` is `num_blocks * page_size_bytes` and consumers read it
+    rather than recomputing, so it has to move with `num_blocks`.
+    """
+    old_num_blocks = cfg.num_blocks
+    if old_num_blocks <= 0:
+        raise ValueError(f"cannot rescale a KV cache config of {old_num_blocks} blocks")
+    cfg.num_blocks = num_blocks
+    for kv_tensor in cfg.kv_cache_tensors:
+        kv_tensor.size = (kv_tensor.size * num_blocks) // old_num_blocks
+
+
+def chiplet_replication_factor(num_key_value_heads: int, rsd_size: int) -> float:
+    """How many times the KV cache is physically replicated across chiplets.
+
+    Each chiplet rounds up to `ceil(kvh / rsd_size)` KV heads, so the ratio is
+    > 1 exactly when `kvh` is not a multiple of `rsd_size`. Examples at
+    rsd_size=4: kvh=2 -> 2.0, kvh=4 -> 1.0, kvh=10 -> 1.2.
+    """
+    if num_key_value_heads <= 0 or rsd_size <= 0:
+        return 1.0
+    return rsd_size * math.ceil(num_key_value_heads / rsd_size) / num_key_value_heads
+
+
+def divide_by_chiplet_replication(
+    nbytes: int, num_key_value_heads: int, rsd_size: int
+) -> int:
+    """`nbytes // chiplet_replication_factor(...)` in exact integer arithmetic."""
+    if num_key_value_heads <= 0 or rsd_size <= 0:
+        return nbytes
+    return (
+        nbytes
+        * num_key_value_heads
+        // (rsd_size * math.ceil(num_key_value_heads / rsd_size))
+    )
 
 
 def estimate_model_kernel_size(
@@ -189,14 +340,33 @@ def estimate_available_memory(
     elif "cr" in device_name:
         assert envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK == 1
         # REBEL - RBLN-CR[xxx]
-        # REBEL DRAM - 144GB (quad chips, chiplet) - system(4G) = 140GB
-        REBEL_DRAM_NBYTES = 144 * 2**30
-        REBEL_SYS_DRAM_NBYTES = 4 * 2**30
-        REBEL_DRAM_NBYTES -= REBEL_SYS_DRAM_NBYTES
         REBEL_CHIPLET_SIZE = 4
         # single device == Quad chiplet
         rsd_size = REBEL_CHIPLET_SIZE
         available_dram_bytes = REBEL_DRAM_NBYTES
+        if envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE:
+            # Flag-gated: reading the driver would tie the default path's KV
+            # size to a driver release, which is not this feature's to decide.
+            try:
+                sysfs_dram_total = read_rbln_card_dram_total_bytes()
+            except RuntimeError as exc:
+                # The reader refuses on heterogeneous cards; this estimate only
+                # wants one card's capacity, so fall back rather than fail.
+                logger.warning(
+                    "%s; falling back to the built-in %d byte DRAM capacity.",
+                    exc,
+                    REBEL_DRAM_NBYTES,
+                )
+                sysfs_dram_total = None
+            if sysfs_dram_total is None:
+                logger.debug(
+                    "sysfs %s is unavailable; falling back to the built-in %d "
+                    "byte DRAM capacity.",
+                    RBLN_SYSFS_CLASS_DIR,
+                    REBEL_DRAM_NBYTES,
+                )
+            else:
+                available_dram_bytes = sysfs_dram_total
         # FIXME(RBLN) - basic data type fp8 for REBEL, for now fp16
         default_bits_per_param = 16
     else:
@@ -252,19 +422,41 @@ def estimate_available_memory(
         buffer = buffer_per_runtime_per_core * num_runtimes
     available_dram_bytes -= buffer
 
+    # NOTE(RBLN): `max(1, rsd_size // kvh)` is optimistic unless kvh divides or
+    # is a multiple of rsd_size. The exact factor is always >= it, so switching
+    # under the flag can only shrink this estimate, never grow it into an OOM.
     rsd_replicas = max(1, rsd_size // num_key_value_heads)
-    available_dram_bytes = available_dram_bytes // rsd_replicas
-
-    if "cr" in device_name and num_key_value_heads % rsd_size != 0:
-        # KV heads are sharded across chiplets, so when they do not divide
-        # evenly a chiplet holds ceil(H / N) heads while owning only 1/N of
-        # DRAM. The bottleneck chiplet limits the usable KV pool to
-        # H / (N * ceil(H / N)) of the uniform estimate (e.g. 10 heads on 4
-        # chiplets -> 10/12), otherwise the per-chiplet allocator OOMs.
-        heads_per_chiplet = math.ceil(num_key_value_heads / rsd_size)
-        available_dram_bytes = (available_dram_bytes * num_key_value_heads) // (
-            rsd_size * heads_per_chiplet
+    released_dram_bytes = available_dram_bytes // rsd_replicas
+    exact_dram_bytes = divide_by_chiplet_replication(
+        available_dram_bytes, num_key_value_heads, rsd_size
+    )
+    if released_dram_bytes != exact_dram_bytes:
+        # NOTE(RBLN): only the flag path acts on this, so only it warns. The
+        # default path keeps the released number and says so at debug level:
+        # warning about an estimate this function is not changing reads as a
+        # fault where there is none.
+        disagreement = (
+            "KV cache replication: num_key_value_heads=%d over %d chiplets is "
+            "replicated %.4gx (%d heads per chiplet), but the released estimate "
+            "divides by %d: %.3f GiB released vs %.3f GiB exact.%s"
         )
+        args = (
+            num_key_value_heads,
+            rsd_size,
+            chiplet_replication_factor(num_key_value_heads, rsd_size),
+            math.ceil(num_key_value_heads / rsd_size),
+            rsd_replicas,
+            released_dram_bytes / 2**30,
+            exact_dram_bytes / 2**30,
+        )
+        # One format string, two tails: `logger.*(a + b)` trips ruff G003.
+        if envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE:
+            logger.warning(disagreement, *args, " Using the exact figure.")
+        else:
+            logger.debug(disagreement, *args, " Keeping the released figure.")
+    available_dram_bytes = (
+        exact_dram_bytes if envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE else released_dram_bytes
+    )
 
     check_oom(available_dram_bytes)
 
@@ -288,7 +480,6 @@ def get_autobind_cpu_ids(
     Returns:
         Comma-separated string of CPU IDs, or "all" or "nobind".
     """
-    # NOTE: It should be checked.
     allowed_numa_nodes = get_visible_memory_node()
     logical_cpu_list = get_allowed_cpu_list()
 
@@ -366,7 +557,7 @@ def get_autobind_cpu_ids(
 
     # Log binding information
     if len(ranks_in_same_numa) > 1:
-        logger.info(
+        logger.debug(
             "auto thread-binding: rank %d (rank_across_dp %d) "
             "-> NUMA node %d, CPUs: %s (exclusive allocation, "
             "shared NUMA node with ranks %s, id, physical core): %s",
@@ -378,7 +569,7 @@ def get_autobind_cpu_ids(
             [(x.id, x.physical_core) for x in logical_cpu_list],
         )
     else:
-        logger.info(
+        logger.debug(
             "auto thread-binding: rank %d (rank_across_dp %d) "
             "-> NUMA node %d, CPUs: %s (exclusive allocation, "
             "id, physical core): %s",
@@ -470,7 +661,7 @@ def set_cpu_affinity(
                     actual_cpu_ids,
                 )
             else:
-                logger.info(
+                logger.debug(
                     "Set CPU affinity for rank %d (local_rank %d): CPUs %s",
                     rank,
                     local_rank,
@@ -485,7 +676,7 @@ def set_cpu_affinity(
             )
             raise
     elif local_omp_cpuid == "nobind":
-        logger.info(
+        logger.debug(
             "Skipping CPU affinity binding for rank %d (local_rank %d): nobind",
             rank,
             local_rank,
@@ -509,7 +700,6 @@ def set_omp_num_threads(
         default_num_threads: Number of threads to use if RBLN_NUM_THREADS
             is not set. Defaults to 2.
     """
-    import torch
 
     # Determine the number of threads to use
     if "RBLN_NUM_THREADS" in os.environ:
@@ -522,7 +712,7 @@ def set_omp_num_threads(
     # Directly set PyTorch's thread count for this process
     torch.set_num_threads(num_threads)
 
-    logger.info(
+    logger.debug(
         "Set torch.num_threads to %d for rank %d (local_rank %d)",
         num_threads,
         rank,
@@ -530,49 +720,166 @@ def set_omp_num_threads(
     )
 
 
+def prepare_kernel_block_sizes(
+    kv_cache_config: KVCacheConfig, attn_groups: list[list[AttentionGroup]]
+) -> list[int]:
+    """
+    Generate kernel_block_sizes that matches each block_size.
+
+    For attention backends that support virtual block splitting,
+    use the supported block sizes from the backend.
+    For other backends (like Mamba), use the same block size (no splitting).
+
+    Args:
+        kv_cache_config: The KV cache configuration.
+        attn_groups: Attention groups indexed by KV cache group id.
+
+    Returns:
+        List of kernel block sizes for each cache group.
+    """
+    kernel_block_sizes = []
+    for kv_cache_gid, kv_cache_group in enumerate(kv_cache_config.kv_cache_groups):
+        kv_cache_spec = kv_cache_group.kv_cache_spec
+        if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs):
+            # All layers in the UniformTypeKVCacheSpecs have the same type,
+            # pick an arbitrary one to dispatch.
+            kv_cache_spec = next(iter(kv_cache_spec.kv_cache_specs.values()))
+        if isinstance(kv_cache_spec, EncoderOnlyAttentionSpec):
+            continue
+        if isinstance(kv_cache_spec, RBLNSlidingWindowSpec):
+            kernel_block_sizes.append(kv_cache_spec.sliding_window)
+        elif isinstance(kv_cache_spec, AttentionSpec):
+            # This is an attention backend that supports virtual block splitting.
+            kv_manager_block_size = kv_cache_group.kv_cache_spec.block_size
+            group_backends = [g.backend for g in attn_groups[kv_cache_gid]]
+            selected_kernel_size = select_common_block_size(
+                kv_manager_block_size, group_backends
+            )
+            kernel_block_sizes.append(selected_kernel_size)
+        elif isinstance(kv_cache_spec, MambaSpec):
+            # This is likely Mamba or other non-attention cache, no splitting.
+            kernel_block_sizes.append(kv_cache_spec.block_size)
+        else:
+            raise NotImplementedError(
+                f"unknown kv cache spec {kv_cache_group.kv_cache_spec}"
+            )
+    return kernel_block_sizes
+
+
+def reorder_input_batch(input_batch: "InputBatch", perm: np.ndarray) -> None:
+    """Permute every per-request field of ``input_batch`` in one vectorized
+    pass (new slot ``k`` takes old index ``perm[k]``).
+
+    Mirrors upstream ``InputBatch.swap_states`` (vllm 0.22.0) but reindexes each
+    field once instead of via N-1 pairwise swaps; the caller emits the
+    logits-processor move records. Keep the field set in sync with
+    ``swap_states`` on vLLM bumps -- ``test_reorder_matches_swap_states`` guards
+    equivalence.
+    """
+    ib = input_batch
+    n = len(perm)
+    # numpy index: valid for advanced indexing of both numpy arrays and tensors.
+    p = np.asarray(perm)
+
+    # token_ids_cpu / is_token_ids rows are max_model_len wide but only
+    # [:num_tokens + spec] is meaningful, so reindex just those columns. valid_w
+    # is permutation-invariant (max over the same values), so read it first.
+    max_spec = max((len(s) for s in ib.spec_token_ids[:n]), default=0)
+    valid_w = min(
+        int(ib.num_tokens_no_spec[:n].max()) + max_spec,
+        ib.token_ids_cpu.shape[1],
+    )
+
+    # request id / token bookkeeping (python lists + index dict)
+    ib._req_ids[:n] = [ib._req_ids[i] for i in p]
+    ib.req_output_token_ids[:n] = [ib.req_output_token_ids[i] for i in p]
+    ib.spec_token_ids[:n] = [ib.spec_token_ids[i] for i in p]
+    for k in range(n):
+        rid = ib._req_ids[k]
+        if rid is not None:
+            ib.req_id_to_index[rid] = k
+
+    # per-request scalars; RHS fancy-index copies, so in-place assign is alias-safe
+    for arr in (
+        ib.num_tokens_no_spec,
+        ib.num_prompt_tokens,
+        ib.num_computed_tokens_cpu,
+    ):
+        arr[:n] = arr[p]
+
+    ib.token_ids_cpu[:n, :valid_w] = ib.token_ids_cpu[p, :valid_w]
+    ib.is_token_ids[:n, :valid_w] = ib.is_token_ids[p, :valid_w]
+
+    if ib.req_prompt_embeds:
+        ib.req_prompt_embeds = {
+            k: ib.req_prompt_embeds[int(p[k])]
+            for k in range(n)
+            if int(p[k]) in ib.req_prompt_embeds
+        }
+
+    # block-table CPU rows + counts (device copy re-synced downstream)
+    for bt in ib.block_table.block_tables:
+        bt.num_blocks_per_row[:n] = bt.num_blocks_per_row[p]
+        bt.block_table.np[:n] = bt.block_table.np[p]
+
+    ib.request_lora_mapping[:n] = ib.request_lora_mapping[p]
+
+    # Pooling models carry no sampling / logits state.
+    if ib.is_pooling_model:
+        return
+
+    for arr in (
+        ib.temperature_cpu,
+        ib.top_p_cpu,
+        ib.top_k_cpu,
+        ib.frequency_penalties_cpu,
+        ib.presence_penalties_cpu,
+        ib.repetition_penalties_cpu,
+        ib.num_accepted_tokens_cpu,
+    ):
+        arr[:n] = arr[p]
+
+    # index-keyed dicts: new slot k inherits old slot p[k]'s entry
+    ib.generators = {
+        k: ib.generators[int(p[k])] for k in range(n) if int(p[k]) in ib.generators
+    }
+    ib.bad_words_token_ids = {
+        k: ib.bad_words_token_ids[int(p[k])]
+        for k in range(n)
+        if int(p[k]) in ib.bad_words_token_ids
+    }
+
+    if ib.allowed_token_ids_mask_cpu_tensor is not None:
+        ib.allowed_token_ids_mask_cpu_tensor[:n] = ib.allowed_token_ids_mask_cpu_tensor[
+            p
+        ]
+
+
 def get_kv_cache_names(
     kv_caches: dict[str, torch.Tensor],
     num_attn_module: int = 1,
 ) -> list[str]:
+    """Return KV cache layer names ordered by layer index.
+
+    A deterministic, hash-seed-independent ordering is required by the KV
+    connector: NIXL assigns transfer region indices in iteration order, so the
+    P/D region <-> layer agreement breaks if the order varies between runs.
+    Adapted from ``vllm.v1.worker.utils.bind_kv_cache``.
     """
-    Get KV cache layer names sorted by layer index.
-
-    Copied and Modified from vllm.v1.worker.utils.bind_kv_cache
-
-    Args:
-        kv_caches: The allocated kv_caches with layer names as keys.
-        num_attn_module: Number of attention modules per layer.
-
-    Returns:
-        List of KV cache layer names in layer index order.
-    """
-    # Convert kv_caches dict to a list of names in the order of layer_index.
-    index2name = defaultdict(list)
+    index2name: dict[int, list[str]] = defaultdict(list)
     for layer_name in kv_caches:
         index2name[extract_layer_index(layer_name, num_attn_module)].append(layer_name)
 
     kv_cache_names: list[str] = []
     for layer_index in sorted(index2name.keys()):
         layer_names = index2name[layer_index]
-        if len(layer_names) > 1:
-            # One typical case is encoder-decoder model, e.g., bart.
-            # The cross attention and self attention in the same decoder layer
-            # has different layer_name but the same layer_index.
-
-            # TODO - analyze where runner_kv_caches is used and the right
-            # way to ensure it properly reflects multiple attention layers
-            # in the same decoder block.
-            if (
-                current_platform.is_cuda_alike()
-                or current_platform.is_xpu()
-                or current_platform.is_cpu()
-            ):
-                # We know that the GPU / CPU runner is not impacted by this
-                # case. Some test code depends on runner_kv_caches, but
-                # not in a way that's impacted by ignoring this.
-                pass
-            else:
-                raise NotImplementedError
-        for layer_name in layer_names:
-            kv_cache_names.append(layer_name)
+        if len(layer_names) > 1 and not (
+            current_platform.is_cuda_alike()
+            or current_platform.is_xpu()
+            or current_platform.is_cpu()
+        ):
+            # Multiple layers sharing one index (e.g. encoder-decoder cross +
+            # self attention) is only known-safe on GPU/CPU runners.
+            raise NotImplementedError
+        kv_cache_names.extend(layer_names)
     return kv_cache_names

@@ -20,18 +20,17 @@ from typing import Any
 import torch
 import torch.distributed as dist
 import vllm.forward_context as vfc
-from vllm.config import CUDAGraphMode, ParallelConfig, VllmConfig
+from vllm.config import ParallelConfig, VllmConfig
 from vllm.forward_context import (
-    BatchDescriptor,
     DPMetadata,
     batchsize_logging_interval,
     create_forward_context,
     override_forward_context,
     track_batchsize,
 )
-from vllm.v1.worker.ubatch_utils import UBatchSlices
+from vllm.platforms import current_platform
 
-import vllm_rbln.rbln_envs as envs
+from vllm_rbln import envs
 from vllm_rbln.logger import init_logger
 
 logger = init_logger(__name__)
@@ -39,31 +38,6 @@ logger = init_logger(__name__)
 
 @dataclass
 class RBLNDPMetadata(DPMetadata):
-    """Cross-DP shape synchronization for MoE + speculative decoding.
-
-    Motivation
-    ----------
-    MoE models with data parallelism require every DP rank to step with the
-    same ``(batch, query_len)`` input shape: the MoE layers fire cross-rank
-    all-reduce / all-to-all for expert dispatch, so any shape divergence
-    either hangs the collective or triggers a hot-path recompile.
-    Speculative decoding makes per-rank decisions diverge naturally -- a rank
-    with drafts wants ``query_len = num_spec_tokens + 1`` while a rank with an
-    ngram miss or a KV-block-boundary request would locally want ``1``.
-
-    Key idea
-    --------
-    1. Bit-packed cross-DP all-reduce (``num_tokens_and_reqs_across_dp``):
-       pack ``(is_prefill, num_reqs, num_tokens)`` into one int32 and run a
-       single gloo all-reduce on the existing CPU group, so every rank learns
-       the per-rank vectors and lifts shape decisions via MAX without extra
-       collectives.
-    2. Query backfill (see ``RBLNScheduler``) makes each rank's per-request
-       query window uniformly ``num_spec_tokens + 1`` *before* communication,
-       so the cross-DP MAX only has to resolve the batch dimension -- the
-       query dimension is already an agreed invariant.
-    """
-
     max_pads_across_dp: torch.Tensor | None = None
 
     @staticmethod
@@ -86,12 +60,8 @@ class RBLNDPMetadata(DPMetadata):
 
     @staticmethod
     def num_tokens_and_reqs_across_dp(
-        num_tokens: int,
-        num_reqs: int,
-        dp_size: int,
-        dp_rank: int,
-        is_prefill: bool,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        num_tokens: int, num_reqs: int, dp_size: int, dp_rank: int, is_prefill: bool
+    ) -> tuple[torch.Tensor, torch.Tensor, bool]:
         """All-reduce per-rank (num_tokens, num_reqs, is_prefill) across DP via
         a single bit-packed int32 and split the result back out.
 
@@ -102,8 +72,8 @@ class RBLNDPMetadata(DPMetadata):
 
         Returns:
             num_tokens_across_dp_cpu: per-rank num_tokens (size dp_size).
-            num_reqs_across_dp_cpu: per-rank num_reqs (size dp_size), or None
-                if any rank is in prefill phase.
+            num_reqs_across_dp_cpu: per-rank num_reqs (size dp_size)
+            any_prefill: whether any rank is in prefill phase.
         """
         token_bits = 16
         req_bits = 14
@@ -137,15 +107,12 @@ class RBLNDPMetadata(DPMetadata):
         )
         num_tokens_across_dp_cpu = encoded_across_dp & token_mask_t
 
-        if any_prefill:
-            num_reqs_across_dp_cpu = None
-        else:
-            req_mask_t = torch.tensor(
-                [req_mask_shifted] * dp_size, device="cpu", dtype=torch.int32
-            )
-            num_reqs_across_dp_cpu = (encoded_across_dp & req_mask_t) >> token_bits
+        req_mask_t = torch.tensor(
+            [req_mask_shifted] * dp_size, device="cpu", dtype=torch.int32
+        )
+        num_reqs_across_dp_cpu = (encoded_across_dp & req_mask_t) >> token_bits
 
-        return num_tokens_across_dp_cpu, num_reqs_across_dp_cpu
+        return num_tokens_across_dp_cpu, num_reqs_across_dp_cpu, any_prefill
 
     @staticmethod
     def make(
@@ -186,16 +153,13 @@ class RBLNDPMetadata(DPMetadata):
 
 
 @contextmanager
-def _set_forward_context(
+def set_forward_context(
     attn_metadata: Any,
     vllm_config: VllmConfig,
     num_tokens: int | None = None,
     num_tokens_across_dp: torch.Tensor | None = None,
-    cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
-    batch_descriptor: BatchDescriptor | None = None,
-    ubatch_slices: UBatchSlices | None = None,
     num_padded_tokens: int | None = None,
-    additional_kwargs: dict[str, Any] | None = None,
+    **kwargs,
 ):
     """A context manager that stores the current forward context,
     can be attention metadata, etc.
@@ -206,11 +170,10 @@ def _set_forward_context(
         vfc.forward_start_time = time.perf_counter()
 
     dp_metadata: DPMetadata | None = None
-    enable_dp = vllm_config.parallel_config.data_parallel_size > 1
-    use_moe_tokens_mask = envs.VLLM_RBLN_USE_MOE_TOKENS_MASK
-    if (enable_dp or use_moe_tokens_mask) and (
-        attn_metadata is not None or num_tokens is not None
-    ):
+    if (
+        vllm_config.parallel_config.data_parallel_size > 1
+        or envs.VLLM_RBLN_USE_MOE_TOKENS_MASK
+    ) and (attn_metadata is not None or num_tokens is not None):
         dp_metadata = RBLNDPMetadata.make(
             vllm_config.parallel_config,
             num_tokens or 0,
@@ -218,20 +181,14 @@ def _set_forward_context(
             num_padded_tokens,
         )
 
+    additional_kwargs = current_platform.set_additional_forward_context(**kwargs)
+
     forward_context = create_forward_context(
         attn_metadata,
         vllm_config,
-        dp_metadata=dp_metadata,
-        cudagraph_runtime_mode=cudagraph_runtime_mode,
-        batch_descriptor=batch_descriptor,
-        ubatch_slices=ubatch_slices,
+        dp_metadata,
+        additional_kwargs=additional_kwargs,
     )
-    if additional_kwargs:
-        existing_additional_kwargs = getattr(forward_context, "additional_kwargs", None)
-        if existing_additional_kwargs is None:
-            forward_context.additional_kwargs = dict(additional_kwargs)
-        else:
-            existing_additional_kwargs.update(additional_kwargs)
 
     try:
         with override_forward_context(forward_context):
@@ -239,14 +196,7 @@ def _set_forward_context(
     finally:
         if need_to_track_batchsize:
             batchsize = num_tokens
-            # we use synchronous scheduling right now,
-            # adding a sync point here should not affect
-            # scheduling of the next batch
-            from vllm.platforms import current_platform
 
-            synchronize = current_platform.synchronize
-            if synchronize is not None:
-                synchronize()
             now = time.perf_counter()
             # time measurement is in milliseconds
             vfc.batchsize_forward_time[batchsize].append(
@@ -271,10 +221,3 @@ def _set_forward_context(
                         ),
                         forward_stats,
                     )
-
-
-vfc.set_forward_context = _set_forward_context
-
-# Importers should prefer this alias so the RBLN-specific kwargs are always
-# accepted even if the monkey-patch above is bypassed by import ordering.
-set_forward_context = _set_forward_context

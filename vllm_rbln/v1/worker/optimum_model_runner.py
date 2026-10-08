@@ -14,6 +14,8 @@
 import contextlib
 import logging
 import time
+from collections.abc import Iterator, Sequence
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any, NamedTuple, Union, cast
 
 import numpy as np
@@ -34,7 +36,6 @@ from vllm.model_executor.models.interfaces_base import (
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import (
     BatchedTensorInputs,
-    MultiModalKwargsItem,
 )
 from vllm.multimodal.utils import group_and_batch_mm_kwargs
 from vllm.sampling_params import SamplingType
@@ -43,7 +44,7 @@ from vllm.tasks import GenerationTask, PoolingTask, SupportedTask
 from vllm.tracing import instrument
 from vllm.utils.import_utils import LazyLoader
 from vllm.utils.jsontree import json_map_leaves
-from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
+from vllm.utils.torch_utils import PIN_MEMORY, kv_cache_dtype_str_to_dtype
 
 # from vllm.utils import LazyLoader, is_pin_memory_available)
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
@@ -61,6 +62,7 @@ from vllm.v1.outputs import (
     SamplerOutput,
 )
 from vllm.v1.sample.logits_processor import build_logitsprocs
+from vllm.v1.sample.logits_processor.interface import LogitsProcessor
 from vllm.v1.sample.sampler import Sampler
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
@@ -69,18 +71,23 @@ from vllm.v1.worker.ec_connector_model_runner_mixin import ECConnectorModelRunne
 from vllm.v1.worker.gpu_input_batch import CachedRequestState
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
 
-import vllm_rbln.rbln_envs as envs
+from vllm_rbln import envs
 from vllm_rbln.logger import init_logger
 from vllm_rbln.model_executor.model_loader.rbln_model_loader import get_optimum_model
-from vllm_rbln.model_executor.models.optimum import ModelInputForRBLN
-from vllm_rbln.utils.optimum.bucket import select_bucket_size
-from vllm_rbln.utils.optimum.predicates import is_qwen3_pooling
-from vllm_rbln.utils.optimum.registry import (
-    get_rbln_model_info,
-    validate_arch_supported,
+from vllm_rbln.model_executor.models.optimum import (
+    ModelInputForRBLN,
+    PartialPrefixInfo,
 )
+from vllm_rbln.model_executor.models.optimum.model_base import (
+    RBLNOptimumDecoderMixin,
+    RBLNOptimumMultimodalMixin,
+)
+from vllm_rbln.utils.optimum.bucket import select_bucket_size
+from vllm_rbln.utils.optimum.predicates import is_qwen3_embedding, is_qwen3_reranker
+from vllm_rbln.utils.optimum.registry import get_rbln_model_info
 from vllm_rbln.v1.core.optimum_scheduler import RBLNSchedulerOutput
 from vllm_rbln.v1.sample import WARM_UP_CONFIGS, RBLNSampler
+from vllm_rbln.v1.sample.rbln_logits_processor import build_rbln_logitsprocs
 from vllm_rbln.v1.worker.ec_disagg_helpers import ECDisaggHelpersMixin
 from vllm_rbln.v1.worker.metrics import PerformanceTracker, collect_metrics
 from vllm_rbln.v1.worker.optimum_input_batch import RBLNInputBatch
@@ -112,14 +119,22 @@ class RBLNOptimumModelRunner(
     input_batch: RBLNInputBatch
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
-        # Validate against upstream vLLM's registry BEFORE the Qwen3 arch remap
-        # below — the remapped name (Qwen3Model) is not in upstream vLLM, but the
-        # original HF arch (Qwen3ForCausalLM) is.
-        validate_arch_supported(vllm_config.model_config)
-        _, model_cls_name = get_rbln_model_info(vllm_config.model_config)
+        # Raises if the architecture has no optimum-rbln counterpart. Must run
+        # before the remap below, which rewrites it to an optimum-rbln-internal
+        # name. vLLM has already rejected anything it cannot resolve itself, so
+        # this only has to cover the RBLN side.
+        get_rbln_model_info(vllm_config.model_config)
 
-        if is_qwen3_pooling(vllm_config.model_config):
-            # NOTE The architecture of Qwen3-Embedding model in huggingface
+        if is_qwen3_reranker(vllm_config.model_config):
+            # Callers pass `Qwen3ForSequenceClassification`, which is how vLLM
+            # selects convert=classify; optimum-rbln has no such class. Map it
+            # back to `Qwen3ForCausalLM`: the score comes from two vocabulary
+            # logits, so the graph needs lm_head, which `Qwen3Model` would drop.
+            vllm_config.model_config.hf_config.__dict__["architectures"] = [
+                "Qwen3ForCausalLM"
+            ]
+        elif is_qwen3_embedding(vllm_config.model_config):
+            # The architecture of Qwen3-Embedding model in huggingface
             # is `Qwen3ForCausalLM`. But it have to be mapped to `Qwen3Model`
             # for optimum-rbln.
             vllm_config.model_config.hf_config.__dict__["architectures"] = [
@@ -141,7 +156,6 @@ class RBLNOptimumModelRunner(
         model_config = self.model_config
         cache_config = self.cache_config
         self.device = device
-        self.pin_memory = False
         self.dtype = self.model_config.dtype
         self.kv_cache_dtype = kv_cache_dtype_str_to_dtype(
             cache_config.cache_dtype, self.model_config
@@ -176,14 +190,23 @@ class RBLNOptimumModelRunner(
         # Sampler
         self.use_rbln_sampler = envs.VLLM_RBLN_SAMPLER
         if self.use_rbln_sampler:
+            assert not vllm_config.model_config.use_fp64_gumbel, (
+                "RBLNSampler does not support use_fp64_gumbel=True. "
+                "Set VLLM_RBLN_SAMPLER=0 to use the CPU sampler, which "
+                "supports fp64 Gumbel-noise sampling."
+            )
             logger.info("Using RBLN sampler: %s", self.use_rbln_sampler)
             self.pooled_tensors: dict[int, torch.Tensor] = {}
             sampler = RBLNSampler(
                 logprobs_mode=self.model_config.logprobs_mode,
+                use_fp64_gumbel=False,
             )
         else:
             logger.info("Using default vLLM sampler.")
-            sampler = Sampler(logprobs_mode=self.model_config.logprobs_mode)
+            sampler = Sampler(
+                logprobs_mode=self.model_config.logprobs_mode,
+                use_fp64_gumbel=vllm_config.model_config.use_fp64_gumbel,
+            )
         self.sampler = sampler
 
         # Attention groups are not supported.
@@ -201,23 +224,31 @@ class RBLNOptimumModelRunner(
         # solution, we initialize the input batch here, and re-initialize it
         # in `initialize_kv_cache` if the block_sizes here is different from
         # the block_sizes in the kv cache config.
+        logits_processors = model_config.logits_processors
+        custom_logitsprocs: Sequence[str | type[LogitsProcessor]] = (
+            tuple(logits_processors) if logits_processors is not None else ()
+        )
+        logitsprocs_builder = (
+            build_rbln_logitsprocs if envs.VLLM_RBLN_SAMPLER else build_logitsprocs
+        )
+        logitsprocs = logitsprocs_builder(
+            self.vllm_config,
+            self.device,
+            PIN_MEMORY,
+            self.is_pooling_model,
+            custom_logitsprocs,
+        )
+
         self.input_batch = RBLNInputBatch(
             max_num_reqs=self.max_num_reqs,
             max_model_len=self.max_model_len,
             max_num_batched_tokens=self.max_num_tokens,
             device=self.device,
-            pin_memory=self.pin_memory,
             vocab_size=self.model_config.get_vocab_size(),
             block_sizes=[cache_config.block_size],
             kernel_block_sizes=[cache_config.block_size],  # FIXME: why do we need this?
             max_num_blocks_per_req=None,
-            logitsprocs=build_logitsprocs(
-                self.vllm_config,
-                self.device,
-                self.pin_memory,
-                self.is_pooling_model,
-                self.vllm_config.model_config.logits_processors,
-            ),
+            logitsprocs=logitsprocs,
             num_spec_tokens=0,  # No spec decode in optimum model runner
             is_pooling_model=self.is_pooling_model,
             use_rbln_sampler=self.use_rbln_sampler,
@@ -242,7 +273,7 @@ class RBLNOptimumModelRunner(
             (self.max_model_len, 1),
             dtype=torch.int64,
             device="cpu",
-            pin_memory=self.pin_memory,
+            pin_memory=PIN_MEMORY,
         )
 
         if envs.VLLM_RBLN_METRICS:
@@ -252,6 +283,8 @@ class RBLNOptimumModelRunner(
         # Encoder cache for EC disaggregation.
         # Maps mm_hash → dict of prefill params (inputs_embeds, position_embed, etc.)
         self.encoder_cache: dict[str, Any] = {}
+
+        self.mrope_position_deltas: dict[str, float] = {}
 
         # Ephemeral state transferred
         # between execute_model() and sample_tokens().
@@ -363,11 +396,13 @@ class RBLNOptimumModelRunner(
                 prefill_has_mm = bool(new_reqs) and bool(new_reqs[0].mm_features)
                 if self.is_ec_consumer and model_input.is_prompt and prefill_has_mm:
                     with capture_ctx as model_reports:
-                        hidden_states = self._run_decoder_with_cached_encoder(
+                        hidden_states = self._run_prefill_with_cached_encoder(
                             model_input, scheduler_output
                         )
                 else:
                     with capture_ctx as model_reports:
+                        model_input = self._build_forward_inputs(model_input)
+                        self.reuse_prefix_cached_kv(model_input, scheduler_output)
                         hidden_states = self.model(model_input)
                 if (
                     envs.VLLM_RBLN_METRICS
@@ -402,6 +437,43 @@ class RBLNOptimumModelRunner(
             ec_connector_output=ec_connector_output,
         )
         return None
+
+    def reuse_prefix_cached_kv(
+        self,
+        model_input: ModelInputForRBLN,
+        scheduler_output: "SchedulerOutput",
+    ) -> None:
+        if not (
+            model_input.is_prompt and isinstance(self.model, RBLNOptimumDecoderMixin)
+        ):
+            return
+        self.model.copy_cached_kv_blocks(
+            scheduler_output.cached_block_table,
+            scheduler_output.cached_length,
+            model_input.block_tables,
+        )
+
+    def _build_forward_inputs(
+        self, model_input: ModelInputForRBLN
+    ) -> ModelInputForRBLN:
+        model = self.model
+        if not isinstance(model, RBLNOptimumMultimodalMixin):
+            return model_input
+
+        for request_id in model_input.finished_requests_ids:
+            self.mrope_position_deltas.pop(request_id, None)
+
+        if model_input.is_prompt:
+            return model.build_prefill_forward_inputs(
+                model_input, self.mrope_position_deltas
+            )
+
+        position_embed = model.compute_decode_position_embed(
+            model_input, self.mrope_position_deltas
+        )
+        if position_embed is None:
+            return model_input
+        return replace(model_input, position_embed=position_embed)
 
     def mask_block_table(
         self,
@@ -474,19 +546,17 @@ class RBLNOptimumModelRunner(
         ):
             is_prefill = True
 
+        partial_prefix = None
         if is_prefill:
             (
                 input_ids,
                 positions,
                 block_tables,
-                cached_block_tables,
-                cached_lengths,
                 multi_modal_kwargs,
                 running_request_ids,
+                partial_prefix,
             ) = self._prepare_prefill(scheduler_output)
         else:
-            cached_block_tables = []
-            cached_lengths = []
             input_ids, positions, block_tables, running_request_ids = (
                 self._prepare_decode(scheduler_output)
             )
@@ -509,11 +579,10 @@ class RBLNOptimumModelRunner(
             block_tables=block_tables,
             running_requests_ids=running_request_ids,
             finished_requests_ids=list(finished_requests_ids),
-            cached_block_tables=cached_block_tables,
-            cached_lengths=cached_lengths,
             # FIXME unify the variable name is_prefill and is_prompt
             is_prompt=is_prefill,
             dummy_block=scheduler_output.dummy_block,
+            partial_prefix=partial_prefix,
         )
         return model_input, num_scheduled_tokens_np
 
@@ -542,30 +611,6 @@ class RBLNOptimumModelRunner(
             )
         return kv_cache_spec
 
-    def _extract_mm_kwargs(
-        self,
-        scheduler_output: "SchedulerOutput",
-    ) -> BatchedTensorInputs:
-        if not scheduler_output or not self.is_multimodal_raw_input_only_model:
-            return {}
-
-        mm_kwargs = list[tuple[str, MultiModalKwargsItem]]()
-        for req in scheduler_output.scheduled_new_reqs:
-            for feature in req.mm_features:
-                if feature.data is not None:
-                    mm_kwargs.append((feature.modality, feature.data))
-
-        # Input all modalities at once
-        mm_kwargs_combined: BatchedTensorInputs = {}
-        for _, _, mm_kwargs_batch in group_and_batch_mm_kwargs(
-            mm_kwargs,
-            device=self.device,
-            pin_memory=self.pin_memory,
-        ):
-            mm_kwargs_combined.update(mm_kwargs_batch)
-
-        return mm_kwargs_combined
-
     def _prepare_prefill(
         self,
         scheduler_output: "RBLNSchedulerOutput",
@@ -573,20 +618,18 @@ class RBLNOptimumModelRunner(
         torch.Tensor,
         torch.Tensor,
         torch.Tensor,
-        list[int],
-        list[int],
         BatchedTensorInputs | None,
         list[str],
+        PartialPrefixInfo | None,
     ]:
         running_request_ids = []
-        batched_mm_inputs: BatchedTensorInputs | None = None
 
         num_blocks_per_req = self.input_batch.block_table.block_tables[
             0
         ].num_blocks_per_row
         block_tables_cpu = self.input_batch.block_table.block_tables[0].get_cpu_tensor()
-        cached_block_table = []
         cached_length = []
+        total_cached_length = 0
 
         if len(scheduler_output.scheduled_new_reqs) == 1:
             # New request started
@@ -611,6 +654,9 @@ class RBLNOptimumModelRunner(
         seq_len = len(prompt_tokens)
         input_positions = list(range(seq_len))
         num_blocks = num_blocks_per_req[req_index]
+        # Full prompt tokens before any prefix-cache trim; needed by MRoPE
+        # models to recompute positions over the whole prompt on a partial hit.
+        full_prompt_tokens = prompt_tokens
         if self.enable_prefix_caching:
             logger.debug(
                 "Request %s is now scheduled. Prompt tokens: %s, "
@@ -621,7 +667,6 @@ class RBLNOptimumModelRunner(
                 block_ids,
             )
             block_table = scheduler_output.block_table_dict[req_id]
-            cached_block_table = scheduler_output.cached_block_table
             cached_length = scheduler_output.cached_length
             total_cached_length = sum(cached_length)
             if total_cached_length > 0:
@@ -644,22 +689,20 @@ class RBLNOptimumModelRunner(
 
         running_request_ids.append(req_id)
 
-        if self.supports_mm_inputs:
-            batched_mm_inputs = self._extract_mm_kwargs(scheduler_output)
+        batched_mm_inputs, partial_prefix = self._extract_prefill_mm_inputs(
+            scheduler_output, total_cached_length, full_prompt_tokens
+        )
 
         input_tokens = torch.tensor(prompt_tokens).unsqueeze(0)
         input_positions = torch.tensor(input_positions).unsqueeze(0)
         block_table = block_table.unsqueeze(0)
-        # NOTE The cached_block_table is not unsqueezed for convenience.
-        # It is used only for prefill
         return (
             input_tokens,
             input_positions,
             block_table,
-            cached_block_table,
-            cached_length,
             batched_mm_inputs,
             running_request_ids,
+            partial_prefix,
         )
 
     def _prepare_decode(
@@ -697,6 +740,111 @@ class RBLNOptimumModelRunner(
         block_tables = torch.stack(block_tables_list)
 
         return input_tokens, input_positions, block_tables, running_request_ids
+
+    def _extract_prefill_mm_inputs(
+        self,
+        scheduler_output: "SchedulerOutput",
+        total_cached_length: int,
+        full_prompt_tokens: np.ndarray,
+    ) -> tuple[BatchedTensorInputs | None, PartialPrefixInfo | None]:
+        """Build the prefill multimodal inputs.
+
+        Returns ``(batched_mm_inputs, partial_prefix)``. ``batched_mm_inputs``
+        encodes the not-fully-cached items; ``partial_prefix`` is set only on a
+        partial hit (``total_cached_length > 0``); see ``PartialPrefixInfo``.
+        """
+        if not self.supports_mm_inputs:
+            return None, None
+        batched_mm_inputs = self._extract_mm_kwargs(
+            scheduler_output, num_cached_tokens=total_cached_length
+        )
+        if total_cached_length <= 0:
+            return batched_mm_inputs, None
+        partial_prefix = PartialPrefixInfo(
+            full_input_tokens=torch.tensor(full_prompt_tokens).unsqueeze(0),
+            num_cached_tokens=total_cached_length,
+            mrope_mm_kwargs=self._extract_mm_kwargs(
+                scheduler_output, num_cached_tokens=0
+            ),
+            mm_embed_tail_starts=self._mm_embed_tail_starts(
+                scheduler_output, total_cached_length
+            ),
+        )
+        return batched_mm_inputs, partial_prefix
+
+    def _extract_mm_kwargs(
+        self,
+        scheduler_output: "SchedulerOutput",
+        num_cached_tokens: int = 0,
+    ) -> BatchedTensorInputs:
+        mm_kwargs = [
+            (feature.modality, feature.data)
+            for feature in self._iter_kept_mm_features(
+                scheduler_output, num_cached_tokens
+            )
+        ]
+        # Input all modalities at once
+        mm_kwargs_combined: BatchedTensorInputs = {}
+        for _, _, mm_kwargs_batch in group_and_batch_mm_kwargs(
+            mm_kwargs,
+            device=self.device,
+            pin_memory=PIN_MEMORY,
+        ):
+            mm_kwargs_combined.update(mm_kwargs_batch)
+
+        return mm_kwargs_combined
+
+    def _mm_embed_tail_starts(
+        self,
+        scheduler_output: "SchedulerOutput",
+        num_cached_tokens: int,
+    ) -> dict[str, list[int]]:
+        """For each kept item, where its uncached part begins.
+
+        When the prefix-cache boundary lands in the middle of an item, the
+        item's leading features are already cached (KV reused) and only the rest
+        need re-scattering into the uncached tail. This returns that split point
+        as a feature index per item, ``max(0, num_cached_tokens - offset)``.
+        Same items and order as ``_extract_mm_kwargs``.
+        """
+        tail_starts: dict[str, list[int]] = {}
+        for feature in self._iter_kept_mm_features(scheduler_output, num_cached_tokens):
+            pos = feature.mm_position
+            cached_tokens = max(0, num_cached_tokens - pos.offset)
+            # cached_tokens is a token count, but we need a feature index. They
+            # match 1:1 for most models, so the count is the index. Some models
+            # (e.g. idefics3) mix non-embedding tokens into the block (tile /
+            # global separators); there, is_embed flags the real feature
+            # positions, so count only those up to the boundary.
+            if pos.is_embed is None:
+                start = cached_tokens
+            else:
+                start = int(pos.is_embed[:cached_tokens].sum())
+            tail_starts.setdefault(feature.modality, []).append(start)
+        return tail_starts
+
+    def _iter_kept_mm_features(
+        self,
+        scheduler_output: "SchedulerOutput",
+        num_cached_tokens: int,
+    ) -> Iterator[Any]:
+        """Yield the multimodal items that still need work this step.
+
+        An item whose tokens are all already in the prefix cache is skipped
+        (its KV is reused, so it needs no re-encoding). ``_extract_mm_kwargs``
+        and ``_mm_embed_tail_starts`` both iterate through here, so they see the
+        same items in the same order.
+        """
+        if not scheduler_output or not self.is_multimodal_raw_input_only_model:
+            return
+        for req in scheduler_output.scheduled_new_reqs:
+            for feature in req.mm_features:
+                if feature.data is None:
+                    continue
+                pos = feature.mm_position
+                if pos.offset + pos.length <= num_cached_tokens:
+                    continue
+                yield feature
 
     def _update_states(self, scheduler_output: "RBLNSchedulerOutput") -> None:
         """Update the cached states and the persistent batch with the scheduler
@@ -925,6 +1073,11 @@ class RBLNOptimumModelRunner(
             self.input_batch.add_request(request)
         # Condense the batched states if there are gaps left by removed requests
         self.input_batch.condense()
+        # Sort requests by length (descending) so the batched dynamic decode
+        # kernel (VLLM_RBLN_BATCH_ATTN_OPT) can honor its per-partition
+        # early-exit contract. Must happen BEFORE refresh_metadata so the
+        # snapshot reflects the sorted order.
+        self._may_reorder_batch(scheduler_output)
 
         # Refresh batch metadata with any pending updates.
         use_padding = self.use_rbln_sampler and self.input_batch.num_reqs > 1
@@ -937,10 +1090,45 @@ class RBLNOptimumModelRunner(
         else:
             self.input_batch.refresh_metadata()
 
+    def _may_reorder_batch(self, scheduler_output: "RBLNSchedulerOutput") -> None:
+        """Reorder requests in the persistent batch by descending sequence length.
+
+        Enabled by `VLLM_RBLN_SORT_BATCH=1`. Required for the batched dynamic
+        decode kernel (VLLM_RBLN_BATCH_ATTN_OPT) to early-exit on shorter
+        sequences per partition — the kernel processes the first valid_batch[p]
+        rows for partition p, which is only correct when rows are sorted long→short.
+        """
+        if not envs.VLLM_RBLN_SORT_BATCH:
+            return
+        if self.input_batch.num_reqs <= 1:
+            return
+
+        orig_indices = np.arange(self.input_batch.num_reqs)
+        sorted_order = np.argsort(
+            self.input_batch.num_tokens_no_spec[orig_indices] * (-1), kind="stable"
+        )
+        src_indices = orig_indices[sorted_order]
+        src_dest_map = {
+            int(src): int(dst)
+            for src, dst in zip(src_indices, orig_indices, strict=False)
+        }
+
+        for src in src_dest_map:
+            dst = src_dest_map[src]
+            while src != dst:
+                self.input_batch.swap_states(src, dst)
+                # Mark dst as done by updating its destination to itself
+                next_dst = src_dest_map.get(dst, dst)
+                src_dest_map[dst] = dst
+                dst = next_dst
+
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         pass
 
     def dummy_sampler_run(self):
+        if self.is_pooling_model:
+            logger.info("Skip dummy sampler run for pooling model.")
+            return
         if not self.use_rbln_sampler:
             logger.info(
                 "Skip dummy sampler run since it is only used in RBLN_SAMPLER=1"
@@ -1033,7 +1221,9 @@ class RBLNOptimumModelRunner(
 
                 with torch.inference_mode():
                     empty_logits = torch.empty(
-                        batch_size, input_batch.vocab_size, dtype=torch.float32
+                        batch_size,
+                        input_batch.vocab_size,
+                        dtype=self.model.dtype,
                     )
                     _ = self.sampler(logits=empty_logits, sampling_metadata=metadata)
 
@@ -1313,7 +1503,6 @@ class RBLNOptimumModelRunner(
         torch._dynamo.config.recompile_limit = len(self.bucket_sizes) * len(
             WARM_UP_CONFIGS
         )
-        self.sampler = torch.compile(self.sampler, dynamic=False, fullgraph=False)
 
     @torch.inference_mode
     def sample_tokens(

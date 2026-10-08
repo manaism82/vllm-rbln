@@ -12,7 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import vllm_rbln.rbln_envs as envs
+# NOTE(eunji.lee): Keep this module free of top-level imports.
+# vLLM resolves platform plugins lazily on the first
+# `vllm.platforms.current_platform` access, which almost any
+# vLLM import triggers. If importing `vllm_rbln` pulls in vLLM before `register`
+# is bound, the plugin loader re-enters this partially initialized module,
+# `getattr(module, "register")` raises, and vLLM falls back to CpuPlatform.
 
 
 def register():
@@ -25,46 +30,14 @@ def register_model():
 
 
 def register_ops():
-    # torch 2.10 added a strict raise in CompileEventLogger.increment_toplevel
-    # / add_to_set_toplevel when no outermost chromium event is active. The
-    # RBLN custom torch.compile backend ends up calling those without a
-    # propagated event (wrap-based approaches at warm_up_model / execute_model
-    # / dummy_run did not work for this code path), so we silence the raise
-    # here. See ``_torch_dynamo_compat.py`` for details.
-    import vllm_rbln._torch_dynamo_compat  # noqa
     import vllm_rbln.distributed.ec_transfer.ec_connector.factory  # noqa
-
-    if not envs.VLLM_RBLN_USE_DEVICE_TENSOR:
-        import vllm_rbln._torch_accelerator_compat  # noqa
+    from vllm_rbln import envs
 
     if envs.VLLM_RBLN_USE_VLLM_MODEL:
-        import vllm_rbln.model_executor.layers.attention.attention  # noqa
+        from vllm_rbln.patches import apply_registered_patches, apply_registrations
+
+        apply_registrations()
+        apply_registered_patches()
+
+        # TODO(RBLN): remove the following imports after we have a better way
         import vllm_rbln.distributed.kv_transfer.kv_connector.factory  # noqa
-        import vllm_rbln.forward_context  # noqa
-        import vllm_rbln.lora.layer  # noqa
-        import vllm_rbln.model_executor.layers.fused_moe.layer  # noqa
-        import vllm_rbln.model_executor.layers.logits_processor  # noqa
-        import vllm_rbln.model_executor.layers.mla  # noqa
-        import vllm_rbln.model_executor.layers.quantization.kernels.mixed_precision  # noqa
-        import vllm_rbln.model_executor.layers.quantization.mxfp4  # noqa
-        import vllm_rbln.model_executor.layers.quantization.fp8  # noqa
-        import vllm_rbln.model_executor.layers.rotary_embedding.base  # noqa
-        import vllm_rbln.model_executor.layers.rotary_embedding.deepseek_scaling_rope  # noqa
-        import vllm_rbln.model_executor.layers.vocab_parallel_embedding  # noqa
-        import vllm_rbln.model_executor.model_loader.weight_loader  # noqa
-        import vllm_rbln.models.deepseek_v2  # noqa
-        import vllm_rbln.models.gpt_oss  # noqa
-        import vllm_rbln.models.qwen2  # noqa
-        import vllm_rbln.models.qwen2_moe  # noqa
-        import vllm_rbln.models.qwen3  # noqa
-        import vllm_rbln.models.qwen3_moe  # noqa
-        import vllm_rbln.models.minimax_m2  # noqa
-        import vllm_rbln.models.utils  # noqa
-        from vllm_rbln.triton_kernels import attention  # noqa
-        from vllm_rbln.triton_kernels import causal_attention  # noqa
-        from vllm_rbln.triton_kernels import flash_attention  # noqa
-        from vllm_rbln.triton_kernels import flash_causal_attention  # noqa
-        from vllm_rbln.triton_kernels import sliding_window_attention  # noqa
-        from vllm_rbln.v1.attention.backends.mla.flashattn_mla import (  # noqa: F401
-            RBLNFlashAttnMLABackend,
-        )

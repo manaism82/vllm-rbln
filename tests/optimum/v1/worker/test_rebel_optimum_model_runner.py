@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import tempfile
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
@@ -29,14 +29,29 @@ from vllm.distributed import (
     init_distributed_environment,
 )
 from vllm.platforms import current_platform
+from vllm.utils.hashing import sha256
+from vllm.v1.core.kv_cache_utils import init_none_hash
 from vllm.v1.core.sched.output import CachedRequestData
 from vllm.v1.sample.metadata import SamplingMetadata
 
+from vllm_rbln.model_executor.models.optimum.base import LinearStateRestoreError
 from vllm_rbln.v1.core.optimum_scheduler import RBLNSchedulerOutput
+from vllm_rbln.v1.core.prefix_cache_manager import LinearStateSnapshot
 from vllm_rbln.v1.worker import optimum_model_runner
 from vllm_rbln.v1.worker.optimum_model_runner import RBLNOptimumModelRunner
 
-from .utils import _schedule_new_request, fake_load_model
+from ..models.optimum.test_qwen3_5_linear_state import (
+    KV_NAMES,
+    _FakeKVRuntime,
+    _snapshot_qwen3_5,
+)
+from .utils import (
+    _schedule_new_request,
+    _schedule_new_request_from_request,
+    create_model_runner,
+    fake_load_model,
+    make_request,
+)
 
 BLOCK_SIZE = 16
 NUM_BLOCKS = 8
@@ -298,3 +313,144 @@ def test_rbln_sampler_runs_on_the_first_language_model_device(
     RBLNOptimumModelRunner(vllm_config, DEVICE)
 
     assert sampler_cls.call_args.kwargs["device_id"] == sampler_device
+
+
+RESTORE = LinearStateSnapshot(slot=0, boundary=4, generation=7)
+CAPTURE = LinearStateSnapshot(slot=1, boundary=8, generation=8)
+
+
+def _hybrid_prefix_hit(monkeypatch):
+    """A prefix-caching runner and a 10-token prefill that resumes from
+    RESTORE (outer block 3) and fills CAPTURE."""
+    monkeypatch.setenv("VLLM_RBLN_SAMPLER", "0")
+    init_none_hash(sha256)
+    runner = create_model_runner()
+    request = make_request("req_0", prompt_token_ids=list(range(1, 11)))
+    scheduler_output = _schedule_new_request_from_request(
+        request, block_ids=([1, 2, 3],), outer_block_ids=[3]
+    )
+    scheduler_output.cached_length = [RESTORE.boundary]
+    scheduler_output.linear_state_restore = RESTORE
+    scheduler_output.linear_state_capture = CAPTURE
+    return runner, scheduler_output
+
+
+def test_execute_model_restores_before_and_captures_after_the_prefill(monkeypatch):
+    runner, scheduler_output = _hybrid_prefix_hit(monkeypatch)
+    events: list[tuple] = []
+    forward = runner.model.forward
+
+    def recording_forward(model_input, **kwargs):
+        events.append(("forward", model_input.input_tokens.tolist()))
+        return forward(model_input, **kwargs)
+
+    runner.model.forward = recording_forward
+    runner.model.restore_linear_state_prefix = lambda snapshot, block: events.append(
+        ("restore", snapshot, block)
+    )
+    runner.model.capture_linear_state_prefix = lambda snapshot, block: events.append(
+        ("capture", snapshot, block)
+    )
+
+    runner.execute_model(scheduler_output)
+
+    assert events == [
+        ("restore", RESTORE, 3),
+        ("forward", [list(range(5, 11))]),
+        ("capture", CAPTURE, 3),
+    ]
+
+
+@pytest.mark.parametrize(
+    "capture, captures",
+    [
+        pytest.param(CAPTURE, (RESTORE, CAPTURE), id="capture_into_another_slot"),
+        pytest.param(None, (RESTORE,), id="no_capture"),
+        # The scheduler already maps the restored slot to the new capture.
+        pytest.param(
+            LinearStateSnapshot(slot=0, boundary=8, generation=8),
+            (LinearStateSnapshot(slot=0, boundary=8, generation=8),),
+            id="capture_into_the_restored_slot",
+        ),
+    ],
+)
+def test_failed_restore_prefills_the_whole_prompt(monkeypatch, capture, captures):
+    runner, scheduler_output = _hybrid_prefix_hit(monkeypatch)
+    scheduler_output.linear_state_capture = capture
+    runner._update_states(scheduler_output)
+    model_input, _ = runner._prepare_inputs(scheduler_output)
+    runner.model.restore_linear_state_prefix = Mock(
+        side_effect=LinearStateRestoreError("stale snapshot")
+    )
+
+    model_input = runner._restore_linear_state_prefix(model_input, scheduler_output)
+
+    runner.model.restore_linear_state_prefix.assert_called_once_with(RESTORE, 3)
+    assert model_input.input_tokens.tolist() == [list(range(1, 11))]
+    assert model_input.input_positions.tolist() == [list(range(10))]
+    assert model_input.linear_state_restore is None
+    assert model_input.linear_state_captures == captures
+
+
+@pytest.mark.parametrize(
+    "held",
+    [
+        pytest.param(None, id="lost_capture"),
+        # The host copy of the prefix the scheduler evicted from slot 0 for
+        # RESTORE, whose own capture never reached the worker.
+        pytest.param(
+            LinearStateSnapshot(slot=0, boundary=12, generation=3),
+            id="stale_generation",
+        ),
+    ],
+)
+def test_a_slot_that_cannot_be_restored_is_captured_again(monkeypatch, held):
+    runner, scheduler_output = _hybrid_prefix_hit(monkeypatch)
+    runtime = _FakeKVRuntime(KV_NAMES)
+    store = _snapshot_qwen3_5(runtime)
+    if held is not None:
+        store.capture_linear_state_prefix(held, block=1)
+    runner.model.restore_linear_state_prefix = store.restore_linear_state_prefix
+    runner.model.capture_linear_state_prefix = store.capture_linear_state_prefix
+    prefix = {name: runtime.device[name][3, :, :4].clone() for name in KV_NAMES}
+    runtime.calls.clear()
+
+    with patch.object(optimum_model_runner, "logger") as logger:
+        runner.execute_model(scheduler_output)
+    runner.sample_tokens(None)
+
+    # The whole prompt was prefilled into outer block 3, and slot 0 now holds
+    # RESTORE under the scheduler's generation.
+    logger.warning.assert_called_once()
+    logger.error.assert_not_called()
+    assert runtime.calls == [
+        *(("get", name, 3, 0, 4) for name in KV_NAMES),
+        *(("get", name, 3, 0, 8) for name in KV_NAMES),
+    ]
+    assert store._snapshot_kv[0][0] == RESTORE
+
+    # The scheduler sends the next request with the prefix to the same slot.
+    next_hit = _schedule_new_request_from_request(
+        make_request("req_1", prompt_token_ids=list(range(1, 11))),
+        block_ids=([4, 5, 6],),
+        outer_block_ids=[2],
+        finished_req_ids=["req_0"],
+    )
+    next_hit.cached_length = [RESTORE.boundary]
+    next_hit.linear_state_restore = RESTORE
+    forwarded = []
+    forward = runner.model.forward
+
+    def recording_forward(model_input, **kwargs):
+        forwarded.append(model_input.input_tokens.tolist())
+        return forward(model_input, **kwargs)
+
+    runner.model.forward = recording_forward
+    runtime.calls.clear()
+
+    runner.execute_model(next_hit)
+
+    assert runtime.calls == [("set", name, 2, 0, 4) for name in KV_NAMES]
+    for name in KV_NAMES:
+        assert torch.equal(runtime.device[name][2, :, :4], prefix[name])
+    assert forwarded == [[list(range(5, 11))]]

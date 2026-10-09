@@ -78,6 +78,7 @@ from vllm_rbln.model_executor.models.optimum import (
     ModelInputForRBLN,
     PartialPrefixInfo,
 )
+from vllm_rbln.model_executor.models.optimum.base import LinearStateRestoreError
 from vllm_rbln.model_executor.models.optimum.model_base import (
     RBLNOptimumDecoderMixin,
     RBLNOptimumMultimodalMixin,
@@ -416,9 +417,16 @@ class RBLNOptimumModelRunner(
                         )
                 else:
                     with capture_ctx as model_reports:
+                        model_input = self._restore_linear_state_prefix(
+                            model_input, scheduler_output
+                        )
                         model_input = self._build_forward_inputs(model_input)
                         self.reuse_prefix_cached_kv(model_input, scheduler_output)
                         hidden_states = self.model(model_input)
+                        for snapshot in model_input.linear_state_captures:
+                            self.model.capture_linear_state_prefix(
+                                snapshot, int(model_input.block_tables[0][0])
+                            )
                 if (
                     envs.VLLM_RBLN_METRICS
                     and self.model_performance_tracker is not None
@@ -452,6 +460,53 @@ class RBLNOptimumModelRunner(
             ec_connector_output=ec_connector_output,
         )
         return None
+
+    def _restore_linear_state_prefix(
+        self,
+        model_input: ModelInputForRBLN,
+        scheduler_output: "RBLNSchedulerOutput",
+    ) -> ModelInputForRBLN:
+        """Write a hybrid prefix hit's KV into the request's outer block.
+
+        If the snapshot cannot be restored (a capture the worker never
+        completed, a host copy left from the slot's previous capture, or a
+        rebel KV API error), the prompt is prefilled from the start instead:
+        the model input is rebuilt without the cached prefix, and that prefill
+        captures the snapshot again. The scheduler cannot learn of the
+        failure, keeps the slot and keeps sending this prefix's hits to it, so
+        re-capturing exactly what it believes the slot holds (same boundary
+        and generation) is what lets the next hit restore. For the same
+        reason this request's prefill_stats, set when it was scheduled, still
+        count the boundary as cached. The boundary is a valid capture point
+        here: the hit left at least one prompt token after it, and the restore
+        checked its range before the generation.
+        """
+        snapshot = model_input.linear_state_restore
+        if snapshot is None:
+            return model_input
+        try:
+            self.model.restore_linear_state_prefix(
+                snapshot, int(model_input.block_tables[0][0])
+            )
+        except LinearStateRestoreError as e:
+            model_input, _ = self._prepare_inputs(
+                replace(scheduler_output, cached_length=[], linear_state_restore=None)
+            )
+            captures = model_input.linear_state_captures
+            # A capture this request makes into the same slot supersedes the
+            # snapshot: the scheduler already maps the slot to it.
+            if all(capture.slot != snapshot.slot for capture in captures):
+                captures = (snapshot, *captures)
+            model_input = replace(model_input, linear_state_captures=captures)
+            logger.warning(
+                "Request %s: cannot restore %s (%s); prefilling the whole "
+                "prompt, which captures slot %d again.",
+                model_input.running_requests_ids[0],
+                snapshot,
+                e,
+                snapshot.slot,
+            )
+        return model_input
 
     def reuse_prefix_cached_kv(
         self,
@@ -598,6 +653,10 @@ class RBLNOptimumModelRunner(
             is_prompt=is_prefill,
             dummy_block=scheduler_output.dummy_block,
             partial_prefix=partial_prefix,
+            linear_state_restore=scheduler_output.linear_state_restore,
+            linear_state_captures=()
+            if scheduler_output.linear_state_capture is None
+            else (scheduler_output.linear_state_capture,),
         )
         return model_input, num_scheduled_tokens_np
 

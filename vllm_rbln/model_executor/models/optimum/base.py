@@ -16,6 +16,8 @@ from dataclasses import dataclass
 import torch
 from vllm.multimodal.inputs import BatchedTensorInputs
 
+from vllm_rbln.v1.core.prefix_cache_manager import LinearStateSnapshot
+
 
 @dataclass(frozen=True)
 class PartialPrefixInfo:
@@ -59,6 +61,17 @@ class ModelInputForRBLN:
     # Set only on a partial prefix-cache hit (see PartialPrefixInfo); None on the
     # no-hit path and for non-MRoPE models.
     partial_prefix: "PartialPrefixInfo | None" = None
+    # Hybrid prefill only: the linear-state snapshot it resumes from and the ones
+    # it fills (see LinearStateSnapshotPool). The scheduler plans at most one
+    # capture; a prefill that falls back from a failed restore also re-captures
+    # the snapshot it could not restore.
+    linear_state_restore: LinearStateSnapshot | None = None
+    linear_state_captures: tuple[LinearStateSnapshot, ...] = ()
+
+
+class LinearStateRestoreError(RuntimeError):
+    """The snapshot could not be written back; the whole prompt must be
+    prefilled instead."""
 
 
 version_error = RuntimeError(

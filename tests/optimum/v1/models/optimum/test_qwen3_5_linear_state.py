@@ -26,6 +26,7 @@ import types
 import pytest
 import torch
 
+from vllm_rbln.model_executor.models.optimum.base import LinearStateRestoreError
 from vllm_rbln.model_executor.models.optimum.optimum_attention import (
     AttentionManager,
     LinearAttentionStrategy,
@@ -33,6 +34,7 @@ from vllm_rbln.model_executor.models.optimum.optimum_attention import (
 from vllm_rbln.model_executor.models.optimum.qwen3_vl import (
     RBLNOptimumQwen3_5ForConditionalGeneration as Qwen3_5,
 )
+from vllm_rbln.v1.core.prefix_cache_manager import LinearStateSnapshot
 
 
 def _prefill(strategy: LinearAttentionStrategy, req: str, bs: int = 4) -> int:
@@ -255,6 +257,8 @@ class TestDecodeLayoutWiring:
             block_tables=torch.tensor([[10]], dtype=torch.int16),
             inputs_embeds=torch.zeros(1, 1, 1),
             position_embed=torch.zeros(2, 1, 1, 1, 1),
+            linear_state_restore=None,
+            linear_state_captures=(),
         )
         obj.forward(model_input)
 
@@ -300,6 +304,8 @@ class TestDecodeLayoutWiring:
                     block_tables=torch.tensor([[10]], dtype=torch.int16),
                     inputs_embeds=torch.zeros(1, 1, 1),
                     position_embed=torch.zeros(2, 1, 1, 1, 1),
+                    linear_state_restore=None,
+                    linear_state_captures=(),
                 )
             )
             return prefilled["batch_idx"]
@@ -331,3 +337,243 @@ class TestDecodeLayoutWiring:
         assert logits.shape[0] == 2
         assert logits[0, 0] == 202
         assert logits[1, 0] == 200
+
+
+class _FakeKVRuntime:
+    """rebel's per-layer KV API over device tensors laid out like the host
+    buffer: [num_blocks, device slices, block_size, head_dim] 2-byte elements.
+    Querying a linear-attention state name aborts the real runtime."""
+
+    def __init__(self, names, num_blocks=4, slices=2, block_size=16, head_dim=2):
+        gen = torch.Generator().manual_seed(0)
+        shape = (num_blocks, slices, block_size, head_dim)
+        self.device = {
+            name: torch.randint(-(2**15), 2**15, shape, generator=gen).to(torch.int16)
+            for name in names
+        }
+        self.calls: list[tuple] = []
+        self.failing: set[str] = set()  # "get" / "set" raise like rebel
+
+    def _host(self, name, host):
+        assert name in self.device, f"KV API called with {name}"
+        return host.view(torch.int16).view(self.device[name].shape)
+
+    def get_kv_cache_size_for_layer(self, name):
+        assert name in self.device, f"KV API called with {name}"
+        return self.device[name].numel() * 2
+
+    def get_kv_cache_for_layer(self, name, block, offset, size, host):
+        self.calls.append(("get", name, block, offset, size))
+        if "get" in self.failing:
+            raise RuntimeError("INIT_INTERNAL")
+        self._host(name, host)[block, :, offset : offset + size] = self.device[name][
+            block, :, offset : offset + size
+        ]
+
+    def set_kv_cache_for_layer(self, name, block, offset, size, host):
+        self.calls.append(("set", name, block, offset, size))
+        if "set" in self.failing:
+            raise RuntimeError("INIT_INTERNAL")
+        self.device[name][block, :, offset : offset + size] = self._host(name, host)[
+            block, :, offset : offset + size
+        ]
+
+    def _copy_kv_cache(self, src, dst, size):
+        self.calls.append(("copy", src, dst, size))
+
+
+def _meta(name, layer_type, shape):
+    return {
+        "name": name,
+        "layer_index": 0,
+        "shape": shape,
+        "layer_type": layer_type,
+        "is_auto": False,
+        "dtype": "bfloat16",
+    }
+
+
+KV_NAMES = ["past_key_values_2", "past_key_values_3"]
+
+
+def _snapshot_qwen3_5(runtime: _FakeKVRuntime) -> Qwen3_5:
+    """Uninitialised wrapper over a fake runtime: layer 0 linear, layer 1 full
+    attention (one logical KV head kept on 2 device slices, 4 outer blocks of
+    16 tokens, prefill chunk 4)."""
+    obj = Qwen3_5.__new__(Qwen3_5)
+    obj.model = types.SimpleNamespace(
+        rbln_config=types.SimpleNamespace(
+            prefill_chunk_size=4,
+            cache_metas=[
+                _meta("conv_state_0", "linear_attention", [6, 3, 8]),
+                _meta("recurrent_state_0", "linear_attention", [6, 8, 8]),
+                *(_meta(n, "full_attention", [4, 1, 16, 2]) for n in KV_NAMES),
+            ],
+        ),
+        prefill_decoder=types.SimpleNamespace(runtime=runtime),
+    )
+    obj._snapshot_kv = {}
+    obj._kv_mirrors = obj._alloc_kv_mirrors()
+    return obj
+
+
+class TestLinearStateSnapshotKV:
+    """The worker half of hybrid prefix caching: the full-attention KV of a
+    snapshot moves through rebel's per-layer KV API only, for the
+    ``full_attention`` cache_metas, at offset 0 of one outer block."""
+
+    def test_capture_then_restore_into_another_block_reproduces_the_prefix(self):
+        runtime = _FakeKVRuntime(KV_NAMES)
+        obj = _snapshot_qwen3_5(runtime)
+        snapshot = LinearStateSnapshot(slot=1, boundary=8, generation=3)
+        prefix = {n: runtime.device[n][1, :, :8].clone() for n in KV_NAMES}
+        target_tail = {n: runtime.device[n][2, :, 8:].clone() for n in KV_NAMES}
+
+        obj.capture_linear_state_prefix(snapshot, block=1)
+        for n in KV_NAMES:
+            runtime.device[n][1].zero_()  # the source block is reused
+        obj.restore_linear_state_prefix(snapshot, block=2)
+
+        for n in KV_NAMES:
+            assert torch.equal(runtime.device[n][2, :, :8], prefix[n])
+            assert torch.equal(runtime.device[n][2, :, 8:], target_tail[n])
+        assert runtime.calls == [
+            *(("get", n, 1, 0, 8) for n in KV_NAMES),
+            *(("set", n, 2, 0, 8) for n in KV_NAMES),
+        ]
+
+    @pytest.mark.parametrize(
+        "held, wanted",
+        [
+            pytest.param(None, LinearStateSnapshot(0, 8, 1), id="never_captured"),
+            pytest.param(
+                LinearStateSnapshot(0, 8, 1),
+                LinearStateSnapshot(0, 8, 2),
+                id="older_generation",
+            ),
+        ],
+    )
+    def test_restore_rejects_a_capture_the_worker_does_not_hold(self, held, wanted):
+        runtime = _FakeKVRuntime(KV_NAMES)
+        obj = _snapshot_qwen3_5(runtime)
+        if held is not None:
+            obj.capture_linear_state_prefix(held, block=0)
+        runtime.calls.clear()
+
+        with pytest.raises(LinearStateRestoreError):
+            obj.restore_linear_state_prefix(wanted, block=1)
+        assert runtime.calls == []
+
+    def test_failed_capture_leaves_no_restorable_snapshot(self):
+        # The prefill already overwrote the slot's state row, so the slot's
+        # previous KV must not survive a capture that fails.
+        runtime = _FakeKVRuntime(KV_NAMES)
+        obj = _snapshot_qwen3_5(runtime)
+        old = LinearStateSnapshot(0, 8, 1)
+        obj.capture_linear_state_prefix(old, block=0)
+        runtime.failing.add("get")
+
+        with pytest.raises(RuntimeError, match="INIT_INTERNAL"):
+            obj.capture_linear_state_prefix(LinearStateSnapshot(0, 12, 2), block=1)
+        with pytest.raises(LinearStateRestoreError):
+            obj.restore_linear_state_prefix(old, block=1)
+
+    def test_restore_reports_a_rebel_error_as_a_restore_failure(self):
+        runtime = _FakeKVRuntime(KV_NAMES)
+        obj = _snapshot_qwen3_5(runtime)
+        snapshot = LinearStateSnapshot(0, 8, 1)
+        obj.capture_linear_state_prefix(snapshot, block=0)
+        runtime.failing.add("set")
+
+        with pytest.raises(LinearStateRestoreError, match="INIT_INTERNAL"):
+            obj.restore_linear_state_prefix(snapshot, block=1)
+
+    @pytest.mark.parametrize(
+        "block, boundary",
+        [
+            pytest.param(4, 8, id="block_past_the_cache"),
+            pytest.param(-1, 8, id="negative_block"),
+            pytest.param(1, 6, id="not_a_chunk_multiple"),
+            pytest.param(1, 20, id="past_the_block_end"),
+        ],
+    )
+    def test_out_of_range_transfer_raises_before_any_kv_call(self, block, boundary):
+        # Slot 0 holds nothing, so the restore also shows that the range is
+        # checked first: the runner re-captures the snapshot of every restore
+        # that fails with LinearStateRestoreError.
+        runtime = _FakeKVRuntime(KV_NAMES)
+        obj = _snapshot_qwen3_5(runtime)
+        snapshot = LinearStateSnapshot(0, boundary, 1)
+
+        with pytest.raises(ValueError):
+            obj.capture_linear_state_prefix(snapshot, block=block)
+        with pytest.raises(ValueError):
+            obj.restore_linear_state_prefix(snapshot, block=block)
+        assert runtime.calls == []
+
+    def test_outer_block_copy_is_refused(self):
+        # rebel's copy_kv_cache rewrites the linear-attention state rows too.
+        runtime = _FakeKVRuntime(KV_NAMES)
+        obj = _snapshot_qwen3_5(runtime)
+        block_tables = torch.tensor([[1, -1]], dtype=torch.int16)
+
+        obj.copy_cached_kv_blocks([], [], block_tables)
+        with pytest.raises(RuntimeError, match="linear-attention state"):
+            obj.copy_cached_kv_blocks([2], [8], block_tables)
+        assert runtime.calls == []
+
+    @pytest.mark.parametrize(
+        "start, restore, captures, restore_row, state_capture",
+        [
+            pytest.param(
+                8,
+                LinearStateSnapshot(1, 8, 5),
+                (LinearStateSnapshot(0, 16, 6),),
+                5,
+                {16: 4},
+                id="hit",
+            ),
+            # The restore of slot 1 failed: the whole prompt is prefilled and
+            # writes slot 1's row again besides the planned capture.
+            pytest.param(
+                0,
+                None,
+                (LinearStateSnapshot(1, 8, 5), LinearStateSnapshot(0, 16, 6)),
+                None,
+                {8: 5, 16: 4},
+                id="failed_restore",
+            ),
+        ],
+    )
+    def test_prefill_passes_the_snapshot_state_rows(
+        self, start, restore, captures, restore_row, state_capture
+    ):
+        # Snapshot slot s is state row batch_size + s (batch_size 4 here).
+        obj = TestDecodeLayoutWiring._bare_qwen3_5(max_batch_size=4)
+        passed = {}
+
+        def fake_prefill(**kw):
+            passed.update(kw)
+            return types.SimpleNamespace(logits=torch.zeros(1, 1))
+
+        obj.model = types.SimpleNamespace(
+            prefill_decoder=fake_prefill,
+            rbln_config=types.SimpleNamespace(dtype=torch.float32),
+        )
+        obj.forward(
+            types.SimpleNamespace(
+                is_prompt=True,
+                running_requests_ids=["A"],
+                input_tokens=torch.tensor([[1]]),
+                input_positions=torch.tensor([[start]]),
+                block_tables=torch.tensor([[10]], dtype=torch.int16),
+                inputs_embeds=torch.zeros(1, 1, 1),
+                position_embed=torch.zeros(2, 1, 1, 1, 1),
+                linear_state_restore=restore,
+                linear_state_captures=captures,
+            )
+        )
+
+        assert passed["batch_idx"] == 0
+        assert passed.get("state_restore_row") == restore_row
+        assert passed["state_capture"] == state_capture

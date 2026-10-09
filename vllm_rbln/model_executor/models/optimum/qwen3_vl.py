@@ -14,14 +14,18 @@
 from dataclasses import replace
 from typing import Any
 
+import numpy as np
 import torch
+from rebel.kv_cache import aligned_tensor
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.models.qwen2_5_vl import (
     Qwen2_5_VLVideoPixelInputs,
 )
 
-from .base import ModelInputForRBLN
+from vllm_rbln.v1.core.prefix_cache_manager import LinearStateSnapshot
+
+from .base import LinearStateRestoreError, ModelInputForRBLN
 from .optimum_attention import AttentionManager, LinearAttentionStrategy
 from .qwen2_vl import MODALITIES, RBLNOptimumQwen2_5_VLForConditionalGeneration
 
@@ -364,6 +368,139 @@ class RBLNOptimumQwen3_5ForConditionalGeneration(
         self.attention_manager: AttentionManager = AttentionManager(
             LinearAttentionStrategy()
         )
+        # Host side of each linear-state snapshot slot (the state itself stays in
+        # its device row): slot -> (the capture it holds, {full-attention KV
+        # name: raw bytes of [device slices, boundary tokens, head_dim]}).
+        self._snapshot_kv: dict[
+            int, tuple[LinearStateSnapshot, dict[str, torch.Tensor]]
+        ] = {}
+        self._kv_mirrors: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+        if (
+            vllm_config.cache_config.enable_prefix_caching
+            and vllm_config.additional_config.get("linear_state_snapshot_slots", 0) > 0
+        ):
+            self._kv_mirrors = self._alloc_kv_mirrors()
+
+    def _alloc_kv_mirrors(self) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
+        """Host staging buffers for rebel's per-layer KV API, one per
+        full-attention KV tensor: ``name -> (buffer, byte view)``.
+
+        get/set_kv_cache_for_layer move ``[block][every device slice][0, size)``
+        between the device and a host buffer laid out like the whole device
+        tensor, ``[num_blocks, device slices, block_size, head_dim]`` (a
+        TP-sharded tensor keeps one slice per device, replicas included), so
+        each buffer holds the layer's entire cache. The byte view addresses it
+        without interpreting the device dtype. Buffers are not shared between
+        tensors because rebel is not known to have finished reading a buffer
+        when set_kv_cache_for_layer returns.
+        """
+        runtime = self.get_prefill_decoder().runtime
+        mirrors = {}
+        for meta in self.model.rbln_config.cache_metas:
+            # CacheMeta objects right after a compile, plain dicts once loaded.
+            if not isinstance(meta, dict):
+                meta = meta._prepare_for_serialization()
+            if meta["layer_type"] != "full_attention":
+                continue
+            name = meta["name"]
+            num_blocks, _, block_size, head_dim = meta["shape"]
+            row_bytes = head_dim * getattr(torch, meta["dtype"]).itemsize
+            nbytes = runtime.get_kv_cache_size_for_layer(name)
+            if nbytes % (num_blocks * block_size * row_bytes):
+                raise RuntimeError(
+                    f"Unexpected host layout of {name}: {nbytes} bytes is not "
+                    f"a whole number of [{num_blocks}, {block_size}, {head_dim}] "
+                    f"{meta['dtype']} slices."
+                )
+            buffer = aligned_tensor(nbytes // 2, dtype=np.float16)
+            mirrors[name] = (
+                buffer,
+                buffer.view(torch.uint8).view(
+                    num_blocks,
+                    nbytes // (num_blocks * block_size * row_bytes),
+                    block_size,
+                    row_bytes,
+                ),
+            )
+        return mirrors
+
+    def _check_snapshot_kv_range(self, block: int, size: int) -> None:
+        # rebel's per-layer KV API has no bounds checks: an out-of-range block
+        # or size moves memory past the buffers, and a rejected call disables
+        # the runtime's KV API until restart.
+        chunk = self.model.rbln_config.prefill_chunk_size
+        for name, (_, view) in self._kv_mirrors.items():
+            num_blocks, _, block_size, _ = view.shape
+            if not (
+                0 <= block < num_blocks and 0 < size <= block_size and size % chunk == 0
+            ):
+                raise ValueError(
+                    f"{name}: block {block} must be in [0, {num_blocks}) and size "
+                    f"{size} a multiple of {chunk} in (0, {block_size}]."
+                )
+
+    def restore_linear_state_prefix(
+        self, snapshot: LinearStateSnapshot, block: int
+    ) -> None:
+        """Write the snapshot's full-attention KV into ``[0, boundary)`` of
+        outer block ``block``. The prefill then resumes from the slot's state
+        row (``state_restore_row``).
+
+        The range is checked first, so a ``LinearStateRestoreError`` always
+        names a boundary that a full prefill of the same prompt can capture
+        again into ``block``."""
+        self._check_snapshot_kv_range(block, snapshot.boundary)
+        held = self._snapshot_kv.get(snapshot.slot)
+        if held is None or held[0] != snapshot:
+            raise LinearStateRestoreError(
+                f"Linear-state snapshot slot {snapshot.slot} holds "
+                f"{held[0] if held is not None else 'nothing'}, not {snapshot}."
+            )
+        runtime = self.get_prefill_decoder().runtime
+        for name, (buffer, view) in self._kv_mirrors.items():
+            view[block, :, : snapshot.boundary].copy_(held[1][name])
+            try:
+                runtime.set_kv_cache_for_layer(
+                    name, block, 0, snapshot.boundary, buffer
+                )
+            except RuntimeError as e:
+                raise LinearStateRestoreError(
+                    f"set_kv_cache_for_layer({name!r}, block={block}, "
+                    f"size={snapshot.boundary}) failed: {e}"
+                ) from e
+
+    def capture_linear_state_prefix(
+        self, snapshot: LinearStateSnapshot, block: int
+    ) -> None:
+        """Keep the full-attention KV of ``[0, boundary)`` of outer block
+        ``block`` for the slot whose state row the prefill just wrote."""
+        # The prefill has already replaced the slot's state row, so its old KV
+        # is dropped before the copy that may fail.
+        self._snapshot_kv.pop(snapshot.slot, None)
+        self._check_snapshot_kv_range(block, snapshot.boundary)
+        runtime = self.get_prefill_decoder().runtime
+        kv = {}
+        for name, (buffer, view) in self._kv_mirrors.items():
+            runtime.get_kv_cache_for_layer(name, block, 0, snapshot.boundary, buffer)
+            kv[name] = view[block, :, : snapshot.boundary].clone()
+        self._snapshot_kv[snapshot.slot] = (snapshot, kv)
+
+    def copy_cached_kv_blocks(
+        self,
+        cached_block_tables: list[int],
+        cached_lengths: list[int],
+        block_tables: torch.Tensor,
+    ) -> None:
+        # rebel's copy_kv_cache also copies the GatedDeltaNet conv/recurrent
+        # state tensors, reading the block id as a state row without a bounds
+        # check, so it overwrites live requests' and snapshot slots' state. A
+        # prefix hit on this model is restored from a linear-state snapshot and
+        # never names a cached outer block.
+        if cached_block_tables:
+            raise RuntimeError(
+                "copy_kv_cache would corrupt the linear-attention state of a "
+                f"hybrid model (cached outer blocks {cached_block_tables})."
+            )
 
     def _decode_batch_indices(self, model_input: ModelInputForRBLN) -> torch.Tensor:
         """The state-cache row (batch_idx) of each running request, in running
@@ -449,6 +586,17 @@ class RBLNOptimumQwen3_5ForConditionalGeneration(
                 "cache_position": kw.pop("cache_position"),
                 "batch_idx": batch_idx,
             }
+            # Snapshot slot s is state row batch_size + s.
+            restore = model_input.linear_state_restore
+            if restore is not None:
+                prefill_kwargs["state_restore_row"] = (
+                    self.decoder_batch_size + restore.slot
+                )
+            if model_input.linear_state_captures:
+                prefill_kwargs["state_capture"] = {
+                    capture.boundary: self.decoder_batch_size + capture.slot
+                    for capture in model_input.linear_state_captures
+                }
             return self.model.prefill_decoder(**prefill_kwargs).logits
 
         batch_indices = self._decode_batch_indices(model_input)

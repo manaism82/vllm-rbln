@@ -83,3 +83,22 @@ class TestUpdateMambaBlockSize:
 
         assert not vllm_config.cache_config.enable_prefix_caching
         assert vllm_config.additional_config == {}
+
+
+class TestKeepOnlyLoadTimeKeys:
+    def test_keeps_placement_and_vision_cache_size_only(self):
+        overrides = {
+            "device": [0, 1],
+            "max_seq_len": 4096,
+            "visual": {
+                "device": [2],
+                "pos_embed_cache_size": 4,
+                "max_seq_len": [8192],
+            },
+            "language_model": {"batch_size": 8},
+        }
+
+        assert from_optimum._keep_only_load_time_keys(overrides) == {
+            "device": [0, 1],
+            "visual": {"device": [2], "pos_embed_cache_size": 4},
+        }

@@ -37,14 +37,22 @@ else:
 logger = init_logger(__name__)
 
 
-def _keep_only_device_keys(obj: dict) -> dict:
-    """Recursively keep only ``device`` entries from nested dict/list."""
+# rbln_config keys a user may still override for a precompiled model. They
+# only decide how the artefact is loaded and run on the host, never what was
+# compiled: ``device`` places a (sub)module on NPUs, ``pos_embed_cache_size``
+# bounds the host cache of the Qwen3.5 vision encoder's interpolated position
+# embeddings (an optimum-rbln load-time option, not saved in rbln_config.json).
+_LOAD_TIME_KEYS = frozenset({"device", "pos_embed_cache_size"})
+
+
+def _keep_only_load_time_keys(obj: dict) -> dict:
+    """Recursively keep only ``_LOAD_TIME_KEYS`` entries from nested dicts."""
     result: dict[str, Any] = {}
     for k, v in obj.items():
-        if k == "device":
+        if k in _LOAD_TIME_KEYS:
             result[k] = v
         elif isinstance(v, dict):
-            filtered = _keep_only_device_keys(v)
+            filtered = _keep_only_load_time_keys(v)
             if filtered:
                 result[k] = filtered
     return result
@@ -61,9 +69,10 @@ def sync_from_optimum(
     params = RBLNParams.from_rbln_config(vllm_config, compiled_rbln_config)
 
     # The compiled artefact is the source of truth. Strip the user's
-    # additional_config down to device-only keys so submodule placement
-    # can still be overridden, but no other parameter sneaks in.
-    vllm_config.additional_config["rbln_config"] = _keep_only_device_keys(
+    # additional_config down to load-time keys so submodule placement (and
+    # other host-side load options) can still be set, but no compile
+    # parameter sneaks in.
+    vllm_config.additional_config["rbln_config"] = _keep_only_load_time_keys(
         vllm_config.additional_config.get("rbln_config", {})
     )
 

@@ -161,9 +161,23 @@ def update_mamba_block_size(vllm_config: VllmConfig, params: "RBLNParams") -> No
         not cache_config.user_specified_mamba_block_size
         and cache_config.mamba_block_size is not None
     ):
-        assert not cache_config.enable_prefix_caching, (
-            "mamba_block_size can only be synced to max_model_len while "
-            "prefix caching is disabled, but prefix caching is enabled. "
-            "RBLN does not support prefix caching for mamba/hybrid models."
-        )
+        # The compiled graph keeps one linear-attention state row per sequence,
+        # not vLLM's per-block mamba states ('align'/'all' cache modes). A hybrid
+        # prefix is instead resumed from the artifact's linear-state snapshot
+        # rows (see LinearStateSnapshotPool), so vLLM's mamba bookkeeping stays
+        # at one block per sequence either way.
+        if cache_config.enable_prefix_caching:
+            if params.linear_state_snapshot_slots > 0:
+                vllm_config.additional_config["linear_state_snapshot_slots"] = (
+                    params.linear_state_snapshot_slots
+                )
+            else:
+                logger.warning(
+                    "Prefix caching is disabled: this hybrid (linear-attention) "
+                    "model was compiled without linear-state snapshot rows. "
+                    "Recompile with rbln_config linear_state_snapshot_slots > 0 "
+                    "to use it."
+                )
+                cache_config.enable_prefix_caching = False
+        cache_config.mamba_cache_mode = "none"
         cache_config.mamba_block_size = params.max_seq_len

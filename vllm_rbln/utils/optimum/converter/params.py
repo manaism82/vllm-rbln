@@ -91,6 +91,9 @@ class RBLNParams:
     # gemma4: descending list of 128-multiples). None for non-multimodal models.
     image_prefill_chunk_size: list[int] | None = None
     tensor_parallel_size: int = 1
+    # Spare linear-attention state rows of a hybrid (Qwen3.5) artifact; prefix
+    # caching on such a model needs at least one.
+    linear_state_snapshot_slots: int = 0
 
     @classmethod
     def from_rbln_config(
@@ -205,6 +208,9 @@ class RBLNParams:
             kvcache_block_size=kvcache_block_size,
             prefill_chunk_size=prefill_chunk_size,
             image_prefill_chunk_size=image_prefill_chunk_size,
+            linear_state_snapshot_slots=_cfg_get(
+                lm_cfg, "linear_state_snapshot_slots", 0
+            ),
         )
 
 

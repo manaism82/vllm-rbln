@@ -136,6 +136,12 @@ class TestParseMultimodal:
         assert params.max_seq_len == 4096
         assert params.kvcache_block_size == 128
 
+    def test_linear_state_snapshot_slots(self):
+        cfg = {"kvcache_block_size": 16384, "max_seq_len": 65536}
+        assert RBLNParams._parse_multimodal(cfg).linear_state_snapshot_slots == 0
+        cfg["linear_state_snapshot_slots"] = 8
+        assert RBLNParams._parse_multimodal(cfg).linear_state_snapshot_slots == 8
+
     def test_uses_language_model_submodule(self):
         cfg = {
             "language_model": {

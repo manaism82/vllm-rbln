@@ -13,5 +13,10 @@
 # limitations under the License.
 
 from .optimum_prefix_cache_manager import RBLNPrefixKVCacheManager
+from .optimum_state_snapshot import LinearStateSnapshot, LinearStateSnapshotPool
 
-__all__ = ["RBLNPrefixKVCacheManager"]
+__all__ = [
+    "LinearStateSnapshot",
+    "LinearStateSnapshotPool",
+    "RBLNPrefixKVCacheManager",
+]

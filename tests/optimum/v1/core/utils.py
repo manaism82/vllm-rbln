@@ -57,6 +57,7 @@ def create_scheduler(
     async_scheduling: bool = False,
     outer_block_size: int = 16,
     enable_prefix_caching: bool = False,
+    linear_state_snapshot_slots: int = 0,
 ) -> RBLNOptimumScheduler:
     """Create RBLNOptimumscheduler under test.
 
@@ -104,6 +105,7 @@ def create_scheduler(
             "rbln_config": {
                 "prefill_chunk_size": block_size,
             },
+            "linear_state_snapshot_slots": linear_state_snapshot_slots,
         },
     )
     kv_cache_config = KVCacheConfig(

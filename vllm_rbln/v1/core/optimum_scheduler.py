@@ -46,6 +46,7 @@ from vllm.v1.utils import record_function_or_nullcontext
 
 from vllm_rbln.logger import init_logger
 from vllm_rbln.v1.core.optimum_kv_cache_manager import RBLNKVCacheManager
+from vllm_rbln.v1.core.prefix_cache_manager import LinearStateSnapshot
 
 logger = init_logger(__name__)
 
@@ -64,12 +65,19 @@ class RBLNSchedulerOutput(SchedulerOutput):
         The index of dummy block for padding. It is required
         if the number of requests is less than the number of batch_size
         in decode phase.
+    linear_state_restore: LinearStateSnapshot | None
+        Hybrid artifacts: the snapshot the prefill resumes from
+        (cached_length is [its boundary], cached_block_table stays empty).
+    linear_state_capture: LinearStateSnapshot | None
+        Hybrid artifacts: the snapshot the prefill fills.
     """
 
     block_table_dict: dict[str, torch.Tensor] = field(default_factory=dict)
     cached_block_table: list[int] = field(default_factory=list)
     cached_length: list[int] = field(default_factory=list)
     dummy_block: int | None = None
+    linear_state_restore: LinearStateSnapshot | None = None
+    linear_state_capture: LinearStateSnapshot | None = None
 
 
 class RBLNOptimumScheduler(Scheduler):
@@ -200,6 +208,9 @@ class RBLNOptimumScheduler(Scheduler):
             attn_block_size = self.vllm_config.additional_config["attn_block_size"]
         else:
             attn_block_size = None
+        linear_state_snapshot_slots = (self.vllm_config.additional_config or {}).get(
+            "linear_state_snapshot_slots", 0
+        )
         # gemma3/gemma4: optimum-rbln's chunked prefill touches extra KV-cache
         # slots beyond the prompt (partition-alignment + trailing chunk
         # write-extent), so `allocate_slots` must reserve them. The prefill chunk
@@ -241,6 +252,7 @@ class RBLNOptimumScheduler(Scheduler):
             prefill_chunk_size=prefill_chunk_size,
             image_prefill_chunk_size=image_prefill_chunk_size,
             needs_chunked_prefill_pad=needs_chunked_prefill_pad,
+            linear_state_snapshot_slots=linear_state_snapshot_slots,
         )
         self.perf_metrics: ModelMetrics | None = None
         if self.log_stats and vllm_config.observability_config.enable_mfu_metrics:
@@ -322,6 +334,8 @@ class RBLNOptimumScheduler(Scheduler):
         cached_block_table: list[int] = []
         cached_length: list[int] = []
         dummy_block: int | None = None
+        linear_state_restore: LinearStateSnapshot | None = None
+        linear_state_capture: LinearStateSnapshot | None = None
 
         # NOTE The scheduling process is changed like below.
         # (1) vllm-rbln distinguishes
@@ -425,14 +439,24 @@ class RBLNOptimumScheduler(Scheduler):
                 # Get the cached blocks for prefix caching.
                 # using new_computed_blocks, num_new_local_computed_tokens
                 if self.cache_config.enable_prefix_caching:
-                    (
-                        cached_block_table,
-                        cached_length,
-                    ) = self.kv_cache_manager.get_prefix_cached_blocks(
-                        request,
-                        new_computed_blocks,
-                        num_new_local_computed_tokens,
-                    )
+                    snapshot_pool = self.kv_cache_manager.linear_state_snapshot_pool
+                    if snapshot_pool is None:
+                        (
+                            cached_block_table,
+                            cached_length,
+                        ) = self.kv_cache_manager.get_prefix_cached_blocks(
+                            request,
+                            new_computed_blocks,
+                            num_new_local_computed_tokens,
+                        )
+                    else:
+                        # Hybrid artifacts never read another request's outer
+                        # block; see LinearStateSnapshotPool.
+                        linear_state_restore, linear_state_capture = snapshot_pool.plan(
+                            request
+                        )
+                        if linear_state_restore is not None:
+                            cached_length = [linear_state_restore.boundary]
 
                     # Update the block table to the return output.
                     self.update_block_table_dict(request, block_table_dict)
@@ -642,6 +666,8 @@ class RBLNOptimumScheduler(Scheduler):
             cached_block_table=cached_block_table,
             cached_length=cached_length,
             dummy_block=dummy_block,
+            linear_state_restore=linear_state_restore,
+            linear_state_capture=linear_state_capture,
         )
 
         # Build the connector meta for ECConnector.

@@ -22,7 +22,10 @@ from vllm.v1.request import Request
 
 from vllm_rbln.logger import init_logger
 from vllm_rbln.v1.core.optimum_kv_cache_coordinator import RBLNKVCacheCoordinator
-from vllm_rbln.v1.core.prefix_cache_manager import RBLNPrefixKVCacheManager
+from vllm_rbln.v1.core.prefix_cache_manager import (
+    LinearStateSnapshotPool,
+    RBLNPrefixKVCacheManager,
+)
 
 logger = init_logger(__name__)
 
@@ -49,6 +52,7 @@ class RBLNKVCacheManager(KVCacheManager):
         prefill_chunk_size: int | None = None,
         image_prefill_chunk_size: list[int] | None = None,
         needs_chunked_prefill_pad: bool = False,
+        linear_state_snapshot_slots: int = 0,
     ) -> None:
         """
         RBLNKVCacheManager = KVCacheManager + PrefixKVCacheManager.
@@ -110,6 +114,9 @@ class RBLNKVCacheManager(KVCacheManager):
                 "prefill_chunk_size is required when needs_chunked_prefill_pad "
                 "is set (gemma3/gemma4)."
             )
+        # Hybrid (linear-state) artifacts restore prefixes from snapshot slots
+        # instead of outer blocks; see LinearStateSnapshotPool.
+        self.linear_state_snapshot_pool: LinearStateSnapshotPool | None = None
         if enable_caching:
             assert attn_block_size is not None, (
                 "attn_block_size must be specified for prefix caching"
@@ -121,6 +128,12 @@ class RBLNKVCacheManager(KVCacheManager):
                 max_num_seqs=max_num_seqs,
                 num_inner_blocks=self.block_pool.num_gpu_blocks - 1,
             )
+            if linear_state_snapshot_slots > 0:
+                self.linear_state_snapshot_pool = LinearStateSnapshotPool(
+                    linear_state_snapshot_slots,
+                    block_size=hash_block_size,
+                    max_boundary=attn_block_size,
+                )
         # Pre-constructed KVCacheBlocks with no blocks, callers should use this
         # via create_kv_cache_blocks instead of creating new ones to avoid GC
         # overhead.
@@ -225,6 +238,13 @@ class RBLNKVCacheManager(KVCacheManager):
                 align_pad += block_size - offset_in_block
             step += run_len
         return align_pad
+
+    def reset_prefix_cache(self) -> bool:
+        if not super().reset_prefix_cache():
+            return False
+        if self.linear_state_snapshot_pool is not None:
+            self.linear_state_snapshot_pool.reset()
+        return True
 
     def free(self, request: Request, preemption: bool = False) -> None:
         """Free the blocks allocated for the request."""

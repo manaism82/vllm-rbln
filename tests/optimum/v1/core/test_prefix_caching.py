@@ -18,10 +18,20 @@ from typing import Any
 import pytest
 import torch
 from vllm import SamplingParams
+from vllm.multimodal.inputs import (
+    MultiModalFeatureSpec,
+    MultiModalKwargsItem,
+    PlaceholderRange,
+)
 from vllm.platforms import current_platform
 from vllm.utils.hashing import sha256
 from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
 from vllm.v1.request import Request, RequestStatus
+
+from vllm_rbln.v1.core.prefix_cache_manager import (
+    LinearStateSnapshot,
+    LinearStateSnapshotPool,
+)
 
 from .utils import create_model_runner_output, create_scheduler
 
@@ -448,3 +458,213 @@ def test_free_outer_blocks(scheduler):
     assert mapping_manager.get_mapping(0) is None
 
     assert len(mapping_manager._inner_to_outer) == 0
+
+
+# Hybrid (linear-state) prefix caching: LinearStateSnapshotPool.
+SHARED = list(range(100, 100 + OB_SIZE))  # a prompt prefix several requests share
+_tail_seed = iter(range(1000, 10**6, 100))
+
+
+def _tail(n: int = 6) -> list[int]:
+    """Tokens no other request has."""
+    start = next(_tail_seed)
+    return list(range(start, start + n))
+
+
+def _snapshot_request(
+    prompt_token_ids: list[int],
+    mm_offset: int | None = None,
+    skip_reading_prefix_cache: bool = False,
+) -> Request:
+    request_id = f"req{prompt_token_ids[-1]}"
+    mm_features = None
+    if mm_offset is not None:
+        mm_features = [
+            MultiModalFeatureSpec(
+                data=MultiModalKwargsItem.dummy(),
+                mm_position=PlaceholderRange(offset=mm_offset, length=2),
+                identifier=f"img-{request_id}",
+                modality="image",
+            )
+        ]
+    return Request(
+        request_id=request_id,
+        prompt_token_ids=prompt_token_ids,
+        sampling_params=SamplingParams(
+            max_tokens=MAX_MODEL_LEN,
+            temperature=0.0,
+            skip_reading_prefix_cache=skip_reading_prefix_cache,
+        ),
+        pooling_params=None,
+        mm_features=mm_features,
+        block_hasher=get_request_block_hasher(IB_SIZE, HASH_FN),
+    )
+
+
+def _pool(num_slots: int) -> LinearStateSnapshotPool:
+    init_none_hash(HASH_FN)
+    return LinearStateSnapshotPool(num_slots, block_size=IB_SIZE, max_boundary=OB_SIZE)
+
+
+def _plan(pool: LinearStateSnapshotPool, prompt_token_ids: list[int], **kwargs):
+    return pool.plan(_snapshot_request(prompt_token_ids, **kwargs))
+
+
+def test_snapshot_second_sighting_captures_the_longest_shared_prefix():
+    """A first sighting cannot tell which part of its prompt is shared, so it
+    only records its boundaries. The next request sharing a prefix captures the
+    largest boundary both have; the one after restores it."""
+    pool = _pool(num_slots=2)
+    assert _plan(pool, SHARED[:10] + _tail()) == (None, None)
+
+    restore, capture = _plan(pool, SHARED[:10] + _tail())
+    assert restore is None
+    assert capture == LinearStateSnapshot(slot=0, boundary=8, generation=1)
+
+    assert _plan(pool, SHARED[:10] + _tail()) == (capture, None)
+
+
+@pytest.mark.parametrize(
+    "prompt_len, mm_offset, boundary",
+    [
+        pytest.param(12, None, 8, id="last_token_is_prefilled"),
+        pytest.param(40, None, OB_SIZE, id="first_outer_block_only"),
+        pytest.param(40, 9, 8, id="stops_before_the_first_image"),
+    ],
+)
+def test_snapshot_boundary_limits(prompt_len, mm_offset, boundary):
+    pool = _pool(num_slots=1)
+    prompt = list(range(7, 7 + prompt_len))
+    _plan(pool, prompt, mm_offset=mm_offset)
+
+    _, capture = _plan(pool, prompt, mm_offset=mm_offset)
+
+    assert capture is not None and capture.boundary == boundary
+
+
+def test_snapshot_flood_without_a_shared_block_never_evicts_a_reused_prefix():
+    """MissingHardhat-style traffic: requests that share less than one block
+    with each other must neither capture nor evict, even with a single slot."""
+    pool = _pool(num_slots=1)
+    _plan(pool, SHARED[:12] + _tail())
+    _, fire = _plan(pool, SHARED[:12] + _tail())
+    assert fire == LinearStateSnapshot(slot=0, boundary=12, generation=1)
+
+    for i in range(100):
+        flood = [50_000 + i] + SHARED[: IB_SIZE - 2] + _tail(12)
+        assert _plan(pool, flood) == (None, None)
+
+    assert _plan(pool, SHARED[:12] + _tail()) == (fire, None)
+
+
+def test_snapshot_restore_and_capture_in_one_request():
+    """A request may resume from a shorter snapshot and capture a longer
+    prefix that an earlier request already showed, into another slot."""
+    pool = _pool(num_slots=2)
+    _plan(pool, SHARED + _tail())  # shows boundaries up to 16
+    _, short = _plan(pool, SHARED[:8] + _tail())
+    assert short == LinearStateSnapshot(slot=0, boundary=8, generation=1)
+
+    restore, capture = _plan(pool, SHARED + _tail())
+    assert restore == short
+    assert capture == LinearStateSnapshot(slot=1, boundary=16, generation=2)
+
+    assert _plan(pool, SHARED + _tail()) == (capture, None)
+
+
+def test_snapshot_eviction_is_least_recently_used():
+    pool = _pool(num_slots=2)
+    prefix = {
+        name: list(range(base, base + 12))
+        for name, base in (("a", 200), ("b", 300), ("c", 400))
+    }
+    captured = {}
+    for name in ("a", "b"):
+        _plan(pool, prefix[name] + _tail())
+        captured[name] = _plan(pool, prefix[name] + _tail())[1]
+    assert _plan(pool, prefix["a"] + _tail())[0] == captured["a"]  # a: last hit
+
+    _plan(pool, prefix["c"] + _tail())
+    _, c = _plan(pool, prefix["c"] + _tail())
+
+    assert c is not None and c.slot == captured["b"].slot
+    assert _plan(pool, prefix["a"] + _tail())[0] == captured["a"]
+    assert _plan(pool, prefix["b"] + _tail())[0] is None
+
+
+def test_snapshot_capture_never_evicts_the_slot_being_restored():
+    pool = _pool(num_slots=1)
+    _plan(pool, SHARED + _tail())
+    _, short = _plan(pool, SHARED[:8] + _tail())
+
+    # A longer shared prefix was seen, but the only slot is the one restored.
+    assert _plan(pool, SHARED + _tail()) == (short, None)
+    assert _plan(pool, SHARED + _tail()) == (short, None)
+
+
+def test_snapshot_skip_reading_prefix_cache_is_a_miss():
+    pool = _pool(num_slots=2)
+    _plan(pool, SHARED[:12] + _tail())
+    _, captured = _plan(pool, SHARED[:12] + _tail())
+
+    # A miss that also does not capture the resident prefix a second time.
+    assert _plan(pool, SHARED[:12] + _tail(), skip_reading_prefix_cache=True) == (
+        None,
+        None,
+    )
+    assert _plan(pool, SHARED[:12] + _tail()) == (captured, None)
+
+
+def test_snapshot_reset_forgets_slots_and_sightings():
+    pool = _pool(num_slots=2)
+    _plan(pool, SHARED[:12] + _tail())
+    _, before = _plan(pool, SHARED[:12] + _tail())
+
+    pool.reset()
+
+    assert _plan(pool, SHARED[:12] + _tail()) == (None, None)
+    _, after = _plan(pool, SHARED[:12] + _tail())
+    assert after is not None and before is not None
+    assert after.generation > before.generation
+
+
+def test_hybrid_prefix_hit_restores_from_a_snapshot_not_an_outer_block():
+    """On a hybrid artifact the scheduler never names another request's outer
+    block (rebel's copy_kv_cache would corrupt the linear-attention state); the
+    hit length comes from the snapshot instead."""
+    init_none_hash(HASH_FN)
+    scheduler = create_scheduler(
+        max_num_seqs=MAX_NUM_SEQ,
+        max_num_batched_tokens=MAX_MODEL_LEN,
+        num_blocks=NUM_BLOCKS,
+        block_size=IB_SIZE,
+        max_model_len=MAX_MODEL_LEN,
+        outer_block_size=OB_SIZE,
+        enable_prefix_caching=True,
+        linear_state_snapshot_slots=2,
+    )
+
+    def prefill(prompt_token_ids):
+        request = _snapshot_request(prompt_token_ids)
+        scheduler.add_request(request)
+        output = scheduler.schedule()
+        scheduler.update_from_output(output, create_model_runner_output(output))
+        scheduler.finish_requests(request.request_id, RequestStatus.FINISHED_ABORTED)
+        return output
+
+    first = prefill(SHARED[:12] + _tail())
+    second = prefill(SHARED[:12] + _tail())
+    third = prefill(SHARED[:12] + _tail())
+
+    assert (first.linear_state_restore, first.linear_state_capture) == (None, None)
+    assert second.linear_state_restore is None
+    assert second.linear_state_capture == LinearStateSnapshot(0, 12, 1)
+    assert second.cached_length == []
+    assert third.linear_state_restore == second.linear_state_capture
+    assert third.linear_state_capture is None
+    assert third.cached_length == [12]
+    for output in (first, second, third):
+        assert output.cached_block_table == []
+
+    assert scheduler.reset_prefix_cache()
+    assert prefill(SHARED[:12] + _tail()).linear_state_restore is None

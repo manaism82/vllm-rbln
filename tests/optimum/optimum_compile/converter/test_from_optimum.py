@@ -39,16 +39,23 @@ class TestUpdateMambaBlockSize:
     def test_snapshot_slots_keep_prefix_caching(self):
         vllm_config = _hybrid_vllm_config(enable_prefix_caching=True)
 
-        from_optimum.update_mamba_block_size(
-            vllm_config,
-            RBLNParams(max_seq_len=MAX_SEQ_LEN, linear_state_snapshot_slots=8),
-        )
+        with patch.object(from_optimum, "logger") as logger:
+            from_optimum.update_mamba_block_size(
+                vllm_config,
+                RBLNParams(max_seq_len=MAX_SEQ_LEN, linear_state_snapshot_slots=8),
+            )
 
         cache_config = vllm_config.cache_config
         assert cache_config.enable_prefix_caching
         assert cache_config.mamba_cache_mode == "none"
         assert cache_config.mamba_block_size == MAX_SEQ_LEN
         assert vllm_config.additional_config == {"linear_state_snapshot_slots": 8}
+        # Operators read this line against vLLM's earlier 'align' warning.
+        logger.info.assert_called_once()
+        message = logger.info.call_args.args[0] % logger.info.call_args.args[1:]
+        assert message.startswith("Qwen3.5 snapshot prefix caching: K=8 slots,")
+        assert "mamba_cache_mode reset to none" in message
+        logger.warning.assert_not_called()
 
     def test_no_snapshot_slots_disables_prefix_caching_with_a_warning(self):
         vllm_config = _hybrid_vllm_config(enable_prefix_caching=True)
@@ -64,6 +71,7 @@ class TestUpdateMambaBlockSize:
         assert cache_config.mamba_block_size == MAX_SEQ_LEN
         assert vllm_config.additional_config == {}
         logger.warning.assert_called_once()
+        logger.info.assert_not_called()
 
     def test_prefix_caching_off_publishes_no_slots(self):
         vllm_config = _hybrid_vllm_config(enable_prefix_caching=False)

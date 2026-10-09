@@ -454,3 +454,45 @@ def test_a_slot_that_cannot_be_restored_is_captured_again(monkeypatch, held):
     for name in KV_NAMES:
         assert torch.equal(runtime.device[name][2, :, :4], prefix[name])
     assert forwarded == [[list(range(5, 11))]]
+
+
+def test_a_failed_capture_is_logged_and_the_next_hit_captures_again(monkeypatch):
+    runner, scheduler_output = _hybrid_prefix_hit(monkeypatch)
+    scheduler_output.cached_length = []
+    scheduler_output.linear_state_restore = None
+    runtime = _FakeKVRuntime(KV_NAMES)
+    store = _snapshot_qwen3_5(runtime)
+    runner.model.restore_linear_state_prefix = store.restore_linear_state_prefix
+    runner.model.capture_linear_state_prefix = store.capture_linear_state_prefix
+    runtime.failing.add("get")
+
+    with patch.object(optimum_model_runner, "logger") as logger:
+        runner.execute_model(scheduler_output)
+    output = runner.sample_tokens(None)
+
+    # The prefill's step completes; only the snapshot is lost.
+    assert output.req_ids == ["req_0"]
+    logger.warning.assert_called_once()
+    message = logger.warning.call_args.args[0] % logger.warning.call_args.args[1:]
+    assert "req_0" in message and str(CAPTURE) in message
+    assert CAPTURE.slot not in store._snapshot_kv
+
+    # The scheduler still maps the slot to CAPTURE and sends the next request
+    # with the prefix to it: the restore finds nothing, so the whole prompt is
+    # prefilled and the slot captured again.
+    runtime.failing.clear()
+    next_hit = _schedule_new_request_from_request(
+        make_request("req_1", prompt_token_ids=list(range(1, 11))),
+        block_ids=([4, 5, 6],),
+        outer_block_ids=[2],
+        finished_req_ids=["req_0"],
+    )
+    next_hit.cached_length = [CAPTURE.boundary]
+    next_hit.linear_state_restore = CAPTURE
+    runtime.calls.clear()
+
+    runner.execute_model(next_hit)
+    runner.sample_tokens(None)
+
+    assert runtime.calls == [("get", name, 2, 0, CAPTURE.boundary) for name in KV_NAMES]
+    assert store._snapshot_kv[CAPTURE.slot][0] == CAPTURE

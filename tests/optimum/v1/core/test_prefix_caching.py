@@ -668,3 +668,39 @@ def test_hybrid_prefix_hit_restores_from_a_snapshot_not_an_outer_block():
 
     assert scheduler.reset_prefix_cache()
     assert prefill(SHARED[:12] + _tail()).linear_state_restore is None
+
+
+@pytest.mark.parametrize("preempted", [False, True])
+def test_hybrid_prefix_cache_stats_count_only_restored_tokens(preempted):
+    """vLLM's get_computed_blocks records inner-block hash hits, but a hybrid
+    prefill reuses only the snapshot it restores; vllm:prefix_cache_hits must
+    say so, for new and for resumed (preempted) requests alike."""
+    init_none_hash(HASH_FN)
+    scheduler = create_scheduler(
+        max_num_seqs=MAX_NUM_SEQ,
+        max_num_batched_tokens=MAX_MODEL_LEN,
+        num_blocks=NUM_BLOCKS,
+        block_size=IB_SIZE,
+        max_model_len=MAX_MODEL_LEN,
+        outer_block_size=OB_SIZE,
+        enable_prefix_caching=True,
+        linear_state_snapshot_slots=2,
+    )
+
+    def prefill_hits():
+        request = _snapshot_request(SHARED[:12] + _tail())
+        request.num_preemptions = int(preempted)
+        scheduler.add_request(request)
+        output = scheduler.schedule()
+        stats = scheduler.kv_cache_manager.make_prefix_cache_stats()
+        scheduler.update_from_output(output, create_model_runner_output(output))
+        scheduler.finish_requests(request.request_id, RequestStatus.FINISHED_ABORTED)
+        assert (stats.preempted_queries if preempted else stats.queries) == 18
+        return (stats.hits, stats.preempted_hits)
+
+    # The second request hits the first one's three shared inner blocks but
+    # only captures; the third restores the 12-token snapshot.
+    expected = [0, 0, 12]
+    assert [prefill_hits() for _ in expected] == [
+        (0, hits) if preempted else (hits, 0) for hits in expected
+    ]

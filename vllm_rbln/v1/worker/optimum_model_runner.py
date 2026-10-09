@@ -78,7 +78,10 @@ from vllm_rbln.model_executor.models.optimum import (
     ModelInputForRBLN,
     PartialPrefixInfo,
 )
-from vllm_rbln.model_executor.models.optimum.base import LinearStateRestoreError
+from vllm_rbln.model_executor.models.optimum.base import (
+    LinearStateCaptureError,
+    LinearStateRestoreError,
+)
 from vllm_rbln.model_executor.models.optimum.model_base import (
     RBLNOptimumDecoderMixin,
     RBLNOptimumMultimodalMixin,
@@ -424,9 +427,25 @@ class RBLNOptimumModelRunner(
                         self.reuse_prefix_cached_kv(model_input, scheduler_output)
                         hidden_states = self.model(model_input)
                         for snapshot in model_input.linear_state_captures:
-                            self.model.capture_linear_state_prefix(
-                                snapshot, int(model_input.block_tables[0][0])
-                            )
+                            # The prefill's output does not depend on the
+                            # capture, and the slot's host copy is already
+                            # dropped: the next hit on the slot fails the
+                            # generation check, prefills the whole prompt and
+                            # captures the slot again.
+                            try:
+                                self.model.capture_linear_state_prefix(
+                                    snapshot, int(model_input.block_tables[0][0])
+                                )
+                            except LinearStateCaptureError as e:
+                                logger.warning(
+                                    "Request %s: cannot capture %s (%s); slot %d "
+                                    "holds nothing until the next hit on it "
+                                    "captures it again.",
+                                    model_input.running_requests_ids[0],
+                                    snapshot,
+                                    e,
+                                    snapshot.slot,
+                                )
                 if (
                     envs.VLLM_RBLN_METRICS
                     and self.model_performance_tracker is not None

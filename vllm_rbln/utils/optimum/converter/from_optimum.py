@@ -171,6 +171,14 @@ def update_mamba_block_size(vllm_config: VllmConfig, params: "RBLNParams") -> No
                 vllm_config.additional_config["linear_state_snapshot_slots"] = (
                     params.linear_state_snapshot_slots
                 )
+                # vLLM's MambaModelConfig has already logged that prefix
+                # caching switched this model to the experimental 'align' mode.
+                logger.info(
+                    "Qwen3.5 snapshot prefix caching: K=%d slots, "
+                    "mamba_cache_mode reset to none (the earlier vLLM "
+                    "align/experimental lines do not apply).",
+                    params.linear_state_snapshot_slots,
+                )
             else:
                 logger.warning(
                     "Prefix caching is disabled: this hybrid (linear-attention) "

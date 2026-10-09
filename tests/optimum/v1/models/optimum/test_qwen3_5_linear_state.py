@@ -26,7 +26,10 @@ import types
 import pytest
 import torch
 
-from vllm_rbln.model_executor.models.optimum.base import LinearStateRestoreError
+from vllm_rbln.model_executor.models.optimum.base import (
+    LinearStateCaptureError,
+    LinearStateRestoreError,
+)
 from vllm_rbln.model_executor.models.optimum.optimum_attention import (
     AttentionManager,
     LinearAttentionStrategy,
@@ -473,7 +476,7 @@ class TestLinearStateSnapshotKV:
         obj.capture_linear_state_prefix(old, block=0)
         runtime.failing.add("get")
 
-        with pytest.raises(RuntimeError, match="INIT_INTERNAL"):
+        with pytest.raises(LinearStateCaptureError, match="INIT_INTERNAL"):
             obj.capture_linear_state_prefix(LinearStateSnapshot(0, 12, 2), block=1)
         with pytest.raises(LinearStateRestoreError):
             obj.restore_linear_state_prefix(old, block=1)

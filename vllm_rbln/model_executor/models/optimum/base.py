@@ -74,6 +74,11 @@ class LinearStateRestoreError(RuntimeError):
     prefilled instead."""
 
 
+class LinearStateCaptureError(RuntimeError):
+    """The snapshot's full-attention KV could not be read back; its slot holds
+    nothing until it is captured again."""
+
+
 version_error = RuntimeError(
     "Incompatible vLLM version detected. "
     "This vLLM version is not compatible with optimum-rbln. "

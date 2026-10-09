@@ -25,7 +25,11 @@ from vllm.model_executor.models.qwen2_5_vl import (
 
 from vllm_rbln.v1.core.prefix_cache_manager import LinearStateSnapshot
 
-from .base import LinearStateRestoreError, ModelInputForRBLN
+from .base import (
+    LinearStateCaptureError,
+    LinearStateRestoreError,
+    ModelInputForRBLN,
+)
 from .optimum_attention import AttentionManager, LinearAttentionStrategy
 from .qwen2_vl import MODALITIES, RBLNOptimumQwen2_5_VLForConditionalGeneration
 
@@ -481,7 +485,15 @@ class RBLNOptimumQwen3_5ForConditionalGeneration(
         runtime = self.get_prefill_decoder().runtime
         kv = {}
         for name, (buffer, view) in self._kv_mirrors.items():
-            runtime.get_kv_cache_for_layer(name, block, 0, snapshot.boundary, buffer)
+            try:
+                runtime.get_kv_cache_for_layer(
+                    name, block, 0, snapshot.boundary, buffer
+                )
+            except RuntimeError as e:
+                raise LinearStateCaptureError(
+                    f"get_kv_cache_for_layer({name!r}, block={block}, "
+                    f"size={snapshot.boundary}) failed: {e}"
+                ) from e
             kv[name] = view[block, :, : snapshot.boundary].clone()
         self._snapshot_kv[snapshot.slot] = (snapshot, kv)
 

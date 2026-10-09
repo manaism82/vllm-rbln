@@ -457,6 +457,18 @@ class RBLNOptimumScheduler(Scheduler):
                         )
                         if linear_state_restore is not None:
                             cached_length = [linear_state_restore.boundary]
+                        # get_computed_blocks recorded vLLM's inner-block hash
+                        # hits in the prefix-cache stats, but a hybrid prefill
+                        # reuses only the restored snapshot.
+                        stats = self.kv_cache_manager.prefix_cache_stats
+                        if stats is not None:
+                            correction = (
+                                sum(cached_length) - num_new_local_computed_tokens
+                            )
+                            if request.num_preemptions > 0:
+                                stats.preempted_hits += correction
+                            else:
+                                stats.hits += correction
 
                     # Update the block table to the return output.
                     self.update_block_table_dict(request, block_table_dict)

@@ -553,7 +553,11 @@ class RBLNOptimumQwenVLForConditionalGeneration(
         )
 
         kwargs = self.preprocess_for_decoder(
-            is_prompt, block_tables, input_ids, cache_position
+            is_prompt,
+            block_tables,
+            input_ids,
+            cache_position,
+            dummy_block=model_input.dummy_block,
         )
         cache_position = kwargs.pop("cache_position")
         block_tables = kwargs.pop("block_tables")

@@ -149,6 +149,7 @@ class TestDecodeLayoutWiring:
             input_positions=torch.tensor([[5], [7]]),
             block_tables=torch.tensor([[10], [11]], dtype=torch.int16),
             position_embed=torch.zeros(2, 2, 1, 1, 1),
+            dummy_block=None,
         )
 
         logits = obj.forward(model_input)
@@ -186,6 +187,7 @@ class TestDecodeLayoutWiring:
             input_positions=torch.tensor([[9]]),
             block_tables=torch.tensor([[10]], dtype=torch.int16),
             position_embed=torch.zeros(2, 1, 1, 1, 1),
+            dummy_block=None,
         )
         logits = obj.forward(model_input)
 
@@ -194,6 +196,39 @@ class TestDecodeLayoutWiring:
         assert recorded["inputs_embeds"][0, 0, 0] == 0  # empty row -> dummy input
         assert logits.shape[0] == 1  # only B's logits returned
         assert logits[0, 0] == 201
+
+    def test_forward_decode_pads_empty_rows_with_the_dummy_block(self):
+        # With prefix caching the scheduler hands decode a dummy block for the
+        # rows no request occupies. A padded row still writes its KV, so it
+        # must land there and not in a free outer block that may hold a cached
+        # prefix (the lowest such block here is 50).
+        obj = self._bare_qwen3_5(max_batch_size=2)
+        obj.attention_manager.add("B", 1)
+
+        recorded = {}
+
+        def fake_decoder(**kw):
+            recorded.update(kw)
+            return types.SimpleNamespace(logits=kw["inputs_embeds"][:, 0, :])
+
+        obj.model = types.SimpleNamespace(
+            embed_tokens=lambda ids: ids.to(torch.float32).unsqueeze(-1),
+            decoders={2: fake_decoder},
+            rbln_config=types.SimpleNamespace(dtype=torch.float32),
+        )
+
+        model_input = types.SimpleNamespace(
+            is_prompt=False,
+            running_requests_ids=["B"],
+            input_tokens=torch.tensor([[201]]),
+            input_positions=torch.tensor([[9]]),
+            block_tables=torch.tensor([[10]], dtype=torch.int16),
+            position_embed=torch.zeros(2, 1, 1, 1, 1),
+            dummy_block=7,
+        )
+        obj.forward(model_input)
+
+        assert recorded["block_tables"].tolist() == [[7], [10]]
 
     def test_forward_prefill_allocates_and_passes_batch_idx(self):
         # Prefill records the request's row and passes it as ``batch_idx`` to the
@@ -283,6 +318,7 @@ class TestDecodeLayoutWiring:
             input_positions=torch.tensor([[3], [7]]),
             block_tables=torch.tensor([[11], [10]], dtype=torch.int16),
             position_embed=torch.zeros(2, 3, 1, 1, 1),
+            dummy_block=None,
         )
         logits = obj.forward(model_input)
 

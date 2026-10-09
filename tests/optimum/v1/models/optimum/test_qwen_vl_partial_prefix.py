@@ -17,6 +17,9 @@ import types
 import torch
 
 from vllm_rbln.model_executor.models.optimum.qwen2_vl import (
+    RBLNOptimumQwen2_5_VLForConditionalGeneration as Qwen2_5_VL,
+)
+from vllm_rbln.model_executor.models.optimum.qwen2_vl import (
     RBLNOptimumQwenVLForConditionalGeneration as QwenVL,
 )
 from vllm_rbln.model_executor.models.optimum.qwen3_vl import (
@@ -180,3 +183,39 @@ class TestBuildPartialMmEmbeds:
         assert all(layer.shape[0] == expected_rows for layer in tail_deepstack)
         # deepstack is sliced with the same boundaries as the main features.
         assert torch.equal(tail_deepstack[0][0], deepstack_layers[0][369])
+
+
+class TestDecodePadding:
+    def test_empty_rows_use_the_dummy_block(self):
+        # With prefix caching the scheduler hands decode a dummy block for the
+        # rows no request occupies. A padded row still writes its KV, so it
+        # must land there and not in a free outer block that may hold a cached
+        # prefix (the lowest such block here is 50).
+        obj = Qwen2_5_VL.__new__(Qwen2_5_VL)
+        obj.decoder_batch_size = 2
+        obj.use_multiple_decoder = False
+        obj.available_blocks = torch.arange(50, 60, dtype=torch.int16)
+        recorded = {}
+
+        def fake_decoder(**kw):
+            recorded.update(kw)
+            return types.SimpleNamespace(logits=kw["inputs_embeds"][:, 0, :])
+
+        obj.model = types.SimpleNamespace(
+            embed_tokens=lambda ids: ids.to(torch.float32).unsqueeze(-1),
+            decoders={2: fake_decoder},
+            rbln_config=types.SimpleNamespace(dtype=torch.float32),
+        )
+        model_input = types.SimpleNamespace(
+            is_prompt=False,
+            running_requests_ids=["A"],
+            input_tokens=torch.tensor([[200]]),
+            input_positions=torch.tensor([[9]]),
+            block_tables=torch.tensor([[10]], dtype=torch.int16),
+            position_embed=torch.zeros(2, 2, 1, 1, 1),
+            dummy_block=7,
+        )
+
+        obj.forward(model_input)
+
+        assert recorded["block_tables"].tolist() == [[10], [7]]

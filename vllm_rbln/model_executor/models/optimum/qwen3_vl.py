@@ -458,6 +458,7 @@ class RBLNOptimumQwen3_5ForConditionalGeneration(
             input_ids,
             cache_position,
             input_block_ids=batch_indices,
+            dummy_block=model_input.dummy_block,
         )
         input_ids = kw.pop("input_ids")
         inputs_embeds = self.model.embed_tokens(input_ids).to(self.dtype)
